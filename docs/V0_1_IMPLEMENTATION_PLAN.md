@@ -161,6 +161,22 @@ be pinned, so they are audited and a repository that sets one *in its own config
 refused. The operator's global configuration is trusted -- `git lfs install` writes its
 filters there, and refusing every LFS repository would be a bug rather than a safeguard.
 
+**The audit is recursive, and finding that out cost a second review round.** The first
+version audited one repository. But `git status --ignore-submodules=none` spawns a child
+`git status` inside every gitlinked submodule, and that child reads the *submodule's* own
+`.git/config` — which the audit never looked at. A repository could therefore put
+`filter.<driver>.clean` one directory down and have the controller run it, while the `-c`
+pins, which *do* propagate into the child, made the other half of the defence look like it
+was working. The masking half landed too: a clean filter defines what Git compares the
+worktree against, so a driver emitting the pristine blob made a genuinely modified submodule
+report clean and `awayctl repos` printed `ready=1/1`.
+
+The general lesson is worth more than the fix: a defence built on "audit every config file
+Git will read" is only as good as your enumeration of which files those are, and `git
+status` reads more of them than it looks like. A submodule whose config cannot be read is
+refused rather than skipped, for the same reason the audit refuses when it cannot run at
+all.
+
 *The default branch is never guessed, and it says where it came from.* Configuration, then
 `refs/remotes/origin/HEAD`, then `None`. There is no fallback to "main" because guessing the
 default branch means guessing which branch is protected, and a wrong guess is a
@@ -179,6 +195,18 @@ having no protected branch while `awayctl repos` happily resolved a base on it. 
 union means a decoy written into a repository can only ever *add* protection, never move it,
 and projects whose default branch cannot be determined at all are named explicitly -- "none"
 and "we could not tell" are different answers.
+
+That union was documented before it was true. `_resolve_default_branch` returned the
+configured value the moment there was one and never consulted `refs/remotes/origin/HEAD`, so
+the set was always `{declared}` *or* `{discovered}` and never both — meaning that for a
+project with no declaration, a decoy written into the repository *replaced* the protected
+branch rather than adding to it, which is the exact failure the paragraph claimed to
+prevent. Discovery is now computed unconditionally and carried alongside the effective
+answer. A union you cannot compute is not a union.
+
+Declaring `defaultBranch` remains the only way to make protection independent of the
+repository: for an undeclared project the protected set is still decided by a file inside
+the tree being supervised, and no amount of unioning changes that.
 
 *One unreadable repository does not stop the others.* A repository whose state cannot be
 read is recorded as a per-project failure rather than raised: it is not enrolled, so it

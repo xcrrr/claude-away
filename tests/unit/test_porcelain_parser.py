@@ -192,7 +192,7 @@ class TestDefaultBranchResolution:
     def test_configuration_wins_without_consulting_git(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
         runner = GitRunner(repo.path)
-        assert _resolve_default_branch(runner, "explicit") == ("explicit", "configured")
+        assert _resolve_default_branch(runner, "explicit") == ("explicit", "configured", None)
 
     def test_origin_head_is_used_when_present(self, tmp_path: Path) -> None:
         """Set locally by a clone. Reading it is not a network call."""
@@ -200,7 +200,11 @@ class TestDefaultBranchResolution:
         repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
         repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
 
-        assert _resolve_default_branch(GitRunner(repo.path), None) == ("trunk", "origin_head")
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (
+            "trunk",
+            "origin_head",
+            "trunk",
+        )
 
     def test_init_default_branch_is_never_consulted(self, tmp_path: Path) -> None:
         """It names what `git init` calls a *new* branch, not this repository's default.
@@ -212,12 +216,12 @@ class TestDefaultBranchResolution:
         """
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
         repo.git("config", "init.defaultBranch", "development")
-        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None, None)
 
     def test_nothing_configured_yields_none_not_a_guess(self, tmp_path: Path) -> None:
         """The whole point: never invent "main"."""
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
-        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None, None)
 
     def test_an_option_shaped_discovered_branch_is_discarded(self, tmp_path: Path) -> None:
         """origin/HEAD is a file anything with repository access can write."""
@@ -227,4 +231,22 @@ class TestDefaultBranchResolution:
         (origin / "HEAD").write_text(
             "ref: refs/remotes/origin/--upload-pack=id\n", encoding="utf-8"
         )
-        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None, None)
+
+
+class TestDiscoveryIsAlwaysComputed:
+    def test_a_declared_branch_does_not_hide_what_the_repository_says(self, tmp_path: Path) -> None:
+        """The union `_protected_branches` documents was impossible to compute before this.
+
+        `_resolve_default_branch` returned the configured value the moment there was one and
+        never looked at origin/HEAD, so the protected set was {declared} or {discovered} and
+        never both -- and for an undeclared project a decoy MOVED protection rather than
+        adding to it.
+        """
+        repo = make_repo(tmp_path / "r", initial_branch="trunk")
+        repo.git("update-ref", "refs/remotes/origin/decoy", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/decoy")
+
+        effective, source, discovered = _resolve_default_branch(GitRunner(repo.path), "trunk")
+        assert (effective, source) == ("trunk", "configured")
+        assert discovered == "decoy", "the repository's own claim must still be visible"

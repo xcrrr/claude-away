@@ -41,6 +41,7 @@ from claude_away.core.validation import validate_config_document
 from claude_away.errors import (
     ClaudeAwayError,
     GitError,
+    NotAGitRepositoryError,
     UnsafeStateLocationError,
     ValidationError,
 )
@@ -123,24 +124,42 @@ def _assert_db_outside_a_repository(path: Path) -> None:
 
     Checked against any repository, not just enrolled ones: at ``init`` time there is no
     configuration to consult, and "inside some repository" is the property that matters.
+
+    Only ``NotAGitRepositoryError`` means "not a repository". Every other Git failure means
+    *we could not tell*, and this used to catch the base ``GitError`` and treat all of them
+    as a pass -- so a repository carrying a repository-local command-bearing key, which is
+    exactly what ``git lfs install --local`` writes, turned the guard off for itself. So did
+    a Git older than 2.26, for every repository. That is the same fail-open shape the config
+    audit had one layer down: a check that did not run is not a pass.
     """
-    parent = path.expanduser().resolve().parent
-    probe = parent
+    resolved = path.expanduser().resolve()
+    probe = resolved.parent
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
 
     try:
-        inspection = inspect_repository(probe)
-    except GitError:
-        return  # not a repository, which is what we want
+        root: Path | None = inspect_repository(probe).root
+    except NotAGitRepositoryError:
+        return  # genuinely not a repository, which is what we want
+    except GitError as exc:
+        raise UnsafeStateLocationError(
+            f"cannot determine whether {probe} is inside a Git repository, so refusing to "
+            f"create the state database there. The ledger that decides whether work is DONE "
+            f"must live outside the repositories it judges, and a check that could not run "
+            f"is not a check that passed",
+            path=str(path),
+            probe=str(probe),
+            reason=exc.code,
+            detail=exc.message,
+        ) from exc
 
     raise UnsafeStateLocationError(
         f"refusing to create the state database inside the Git repository at "
-        f"{inspection.root}: the ledger that decides whether work is DONE must live "
+        f"{root}: the ledger that decides whether work is DONE must live "
         f"outside the repositories it judges. Pass --db, or set CLAUDE_AWAY_DB, to a "
         f"location outside any repository",
         path=str(path),
-        repository_root=str(inspection.root),
+        repository_root=str(root),
     )
 
 
@@ -416,9 +435,13 @@ def cmd_repos(args: argparse.Namespace) -> int:
     for repository in enrolment.repositories:
         entry: dict[str, Any] = dict(repository.to_dict())
         try:
-            inspection = inspect_repository(
-                repository.root, configured_default_branch=repository.default_branch
-            )
+            # The inspection enrolment already performed, not a second one. Re-inspecting
+            # with `configured_default_branch=repository.default_branch` fed a value the
+            # repository may itself have asserted back in through the parameter reserved for
+            # the operator's declaration, so the JSON carried `origin_head` at the top level
+            # and `configured` in the nested inspection for the same branch -- and the false
+            # one claimed operator authority.
+            inspection = enrolment.inspections[repository.project_id]
             resolution = resolve_expected_base(inspection, project_id=repository.project_id)
         except GitError as exc:
             # One repository's failure must not take the report down with it. A supervisor
@@ -480,10 +503,12 @@ def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[lis
     branches: set[str] = set()
     unknown: list[str] = []
 
+    declared: set[str] = set()
     for project in document.get("projects", []):
         configured = project.get("defaultBranch")
         if configured:
-            branches.add(str(configured))
+            declared.add(str(configured))
+    branches |= declared
 
     try:
         enrolment = enrol_projects(document, config_dir=config_dir)
@@ -494,9 +519,15 @@ def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[lis
         return sorted(branches), unknown
 
     for repository in enrolment.repositories:
-        if repository.default_branch:
-            branches.add(repository.default_branch)
-        else:
+        # Both, not whichever one won. `_resolve_default_branch` returns the configured
+        # value the moment there is one, so taking only `default_branch` made the set
+        # {declared} or {discovered} and never both -- and for a project with no declaration
+        # a decoy in `refs/remotes/origin/HEAD` therefore *moved* protection off the real
+        # branch rather than adding to it, which is the opposite of what this documented.
+        for candidate in (repository.default_branch, repository.discovered_default_branch):
+            if candidate:
+                branches.add(candidate)
+        if not repository.default_branch:
             unknown.append(repository.project_id)
 
     return sorted(branches), sorted(unknown)

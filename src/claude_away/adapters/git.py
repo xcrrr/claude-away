@@ -59,6 +59,7 @@ from typing import Any
 
 from claude_away.errors import (
     GitCommandError,
+    GitError,
     GitOutputError,
     NotAGitRepositoryError,
     UnsafeRepositoryConfigError,
@@ -278,6 +279,13 @@ class RepositoryInspection:
     default_branch_source: str | None
     """``"configured"``, ``"origin_head"``, or ``None``. Who said so, not just what."""
 
+    discovered_default_branch: str | None
+    """What ``refs/remotes/origin/HEAD`` says, regardless of what the operator declared.
+
+    Recorded even when it is not the effective answer, so a caller can protect both and a
+    repository can only ever add to the protected set, never move it.
+    """
+
     remotes: tuple[str, ...]
 
     @property
@@ -294,6 +302,7 @@ class RepositoryInspection:
             "unborn": self.is_unborn,
             "default_branch": self.default_branch,
             "default_branch_source": self.default_branch_source,
+            "discovered_default_branch": self.discovered_default_branch,
             "remotes": list(self.remotes),
             "operations_in_progress": [op.value for op in self.operations_in_progress],
             "status": self.status.to_dict(),
@@ -571,8 +580,107 @@ def _repository_defined_command_config(runner: GitRunner) -> list[str]:
     return offenders
 
 
-def _assert_configuration_is_inert(runner: GitRunner, path: Path) -> None:
-    offenders = _repository_defined_command_config(runner)
+def _gitlink_paths(runner: GitRunner) -> tuple[str, ...]:
+    """Repository-relative paths of gitlink entries -- that is, submodules.
+
+    Read from the index (``git ls-files -s``), not from ``.gitmodules`` and not from
+    ``git submodule``: the index is what ``git status`` actually consults when it decides
+    to descend, and it is a plain file read that executes nothing. A submodule removed from
+    ``.gitmodules`` but still gitlinked is still descended into, so ``.gitmodules`` would be
+    the wrong source.
+    """
+    completed = runner.run("ls-files", "-s", "-z", check=False)
+    if completed.returncode != 0:
+        raise GitCommandError(
+            list(completed.args),
+            completed.returncode,
+            completed.stderr.decode("utf-8", "replace")[:_MAX_STDERR_CHARS],
+        )
+
+    paths: list[str] = []
+    for record in completed.stdout.split(b"\x00"):
+        if not record:
+            continue
+        # "<mode> <object> <stage>\t<path>"
+        metadata, separator, raw_path = record.partition(b"\t")
+        if separator and metadata.startswith(b"160000 "):
+            paths.append(_decode(raw_path))
+    return tuple(paths)
+
+
+#: How deep to follow nested submodules. Submodules nest legitimately but not deeply, and a
+#: bound means a pathological tree cannot turn inspection into an unbounded walk.
+_MAX_SUBMODULE_DEPTH = 8
+
+
+def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 0) -> None:
+    """Refuse a repository -- or any submodule of it -- that names commands Git would run.
+
+    The recursion is the whole point, and its absence was a critical hole. ``git status
+    --ignore-submodules=none`` spawns a child ``git status`` inside every gitlinked
+    submodule, and that child reads the *submodule's* own ``.git/config``. Auditing only the
+    superproject left a repository free to put ``filter.<driver>.clean`` one directory down
+    and have the controller run it -- while the ``-c`` pins, which do propagate into the
+    child, made the other half of the defence look like it was working.
+
+    The masking half is worse than the execution half. A clean filter defines what Git
+    compares the worktree against, so a driver that always emits the pristine blob makes a
+    genuinely modified submodule report clean: ``awayctl repos`` said ``ready=1/1``,
+    ``dirty_submodules=[]`` and ``resolved=True`` for a tree carrying somebody else's
+    uncommitted work. Demonstrated with a real ``git submodule add`` submodule before this
+    was written.
+    """
+    offenders = list(_repository_defined_command_config(runner))
+
+    if _depth < _MAX_SUBMODULE_DEPTH:
+        root = runner.path("rev-parse", "--show-toplevel").resolve()
+        for relative in _gitlink_paths(runner):
+            worktree = (root / relative).resolve()
+            if not worktree.is_dir():
+                continue  # gitlinked but not checked out: nothing to descend into
+
+            child = GitRunner(worktree, timeout=runner.timeout)
+            try:
+                child_root = child.path("rev-parse", "--show-toplevel").resolve()
+            except GitError as exc:
+                # Git could not say what this path is -- a corrupt submodule config does
+                # this. Skipping would be the wrong answer twice over: `git status` descends
+                # regardless and fails there with an untyped error, and "we could not look"
+                # must never read as "nothing to find".
+                raise UnsafeRepositoryConfigError(
+                    "a submodule's Git configuration could not be read, and `git status` "
+                    "descends into it regardless; Claude Away will not inspect a repository "
+                    "it cannot fully check",
+                    path=str(path),
+                    submodule=relative,
+                    detail=exc.message,
+                ) from exc
+            if child_root != worktree:
+                # A gitlinked path that is not itself a repository root. Git walks *up* from
+                # `-C`, so without this check the child runner resolves back to the
+                # superproject and we audit it again -- once per level, to the depth cap --
+                # while learning nothing. `git status` has no separate config to read here
+                # either, because there is no repository at this path to read one from.
+                continue
+
+            try:
+                _assert_configuration_is_inert(child, worktree, _depth + 1)
+            except UnsafeRepositoryConfigError as exc:
+                # Prefixed with the submodule path so the operator is told *where* to look;
+                # "filter.pwn.clean" alone would send them to the wrong .git/config.
+                offenders.extend(f"{relative}:{key}" for key in exc.details.get("keys", ()))
+            except GitError as exc:
+                # A submodule we cannot read is a submodule we cannot clear. `git status`
+                # descends into it regardless, so refusing is the only honest answer -- the
+                # same rule as the audit itself: a check that did not run is not a pass.
+                raise UnsafeRepositoryConfigError(
+                    "a submodule's Git configuration could not be checked, and `git status` "
+                    "descends into it regardless; Claude Away will not inspect a repository "
+                    "it cannot fully check",
+                    path=str(path),
+                    submodule=relative,
+                ) from exc
+
     if offenders:
         raise UnsafeRepositoryConfigError(
             "repository-local Git configuration defines commands that Git would execute "
@@ -650,9 +758,30 @@ def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
     return tuple(found)
 
 
+def _discover_default_branch(runner: GitRunner) -> str | None:
+    """The default branch as the *repository* records it, from ``refs/remotes/origin/HEAD``.
+
+    Computed unconditionally, even when the operator has declared a branch, because the
+    caller that decides what to protect needs both answers. ``_protected_branches`` claimed
+    to take the union of declared and discovered, and could not: this function used to
+    return the configured value and never look, so the set was always one or the other and
+    a decoy written into the repository *replaced* the protected branch instead of adding
+    to it. A union you cannot compute is not a union.
+    """
+    completed = runner.run("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+    if completed.returncode != 0:
+        return None
+    reference = completed.stdout.decode("utf-8", "replace").strip()
+    prefix = "refs/remotes/origin/"
+    if not reference.startswith(prefix):
+        return None
+    candidate = reference[len(prefix) :]
+    return candidate if is_safe_ref(candidate) else None
+
+
 def _resolve_default_branch(
     runner: GitRunner, configured: str | None
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """Determine the repository's default branch without touching the network.
 
     Returns ``(branch, source)``, where ``source`` is ``"configured"``, ``"origin_head"``
@@ -687,19 +816,12 @@ def _resolve_default_branch(
     repository concerned; returning the value would raise out of whichever caller resolved
     it next and, in ``awayctl repos``, take every other repository's verdict down with it.
     """
+    discovered = _discover_default_branch(runner)
     if configured is not None:
-        return configured, "configured"
-
-    completed = runner.run("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
-    if completed.returncode == 0:
-        reference = completed.stdout.decode("utf-8", "replace").strip()
-        prefix = "refs/remotes/origin/"
-        if reference.startswith(prefix):
-            candidate = reference[len(prefix) :]
-            if is_safe_ref(candidate):
-                return candidate, "origin_head"
-
-    return None, None
+        return configured, "configured", discovered
+    if discovered is not None:
+        return discovered, "origin_head", discovered
+    return None, None, discovered
 
 
 def inspect_repository(
@@ -780,7 +902,7 @@ def inspect_repository(
         line for line in runner.text("remote", check=False).splitlines() if line.strip()
     )
 
-    default_branch, default_branch_source = _resolve_default_branch(
+    default_branch, default_branch_source, discovered_default_branch = _resolve_default_branch(
         runner, configured_default_branch
     )
 
@@ -795,6 +917,7 @@ def inspect_repository(
         operations_in_progress=_operations_in_progress(git_dir),
         default_branch=default_branch,
         default_branch_source=default_branch_source,
+        discovered_default_branch=discovered_default_branch,
         remotes=remotes,
     )
 

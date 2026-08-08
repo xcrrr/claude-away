@@ -497,3 +497,88 @@ class TestInitRefusesToLiveInsideARepository:
     def test_a_path_outside_every_repository_still_works(self, tmp_path: Path) -> None:
         assert main(["--json", "--db", str(tmp_path / "state" / "state.db"), "init"]) == EXIT_OK
         assert (tmp_path / "state" / "state.db").exists()
+
+
+class TestInitGuardFailsClosed:
+    """A check that could not run is not a check that passed."""
+
+    def test_a_repository_with_a_local_filter_does_not_disable_the_guard(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`git lfs install --local` writes exactly this key. No hostility required.
+
+        The guard caught the base GitError, so UnsafeRepositoryConfigError -- raised for the
+        repository the audit considers *least* trustworthy -- read as "not a repository",
+        and the ledger that decides DONE was created inside it.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        repo.git("config", "--local", "filter.lfs.clean", "git-lfs clean -- %f")
+        monkeypatch.setenv("XDG_STATE_HOME", str(repo.path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
+
+        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+        assert not (repo.path / "state").exists()
+
+    def test_a_genuine_non_repository_is_still_allowed(self, tmp_path: Path) -> None:
+        assert main(["--json", "--db", str(tmp_path / "elsewhere" / "state.db"), "init"]) == EXIT_OK
+
+
+class TestReposDoesNotLaunderProvenance:
+    def test_a_discovered_branch_is_never_relabelled_as_configured(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`cmd_repos` re-inspected, feeding the discovered value back in as the operator's.
+
+        The JSON then carried two contradictory provenance claims for one branch, and the
+        false one asserted operator authority for a string the repository wrote.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_OK
+        entry = json.loads(capsys.readouterr().out)["repositories"][0]
+
+        assert entry["default_branch_source"] == "origin_head"
+        assert entry["inspection"]["default_branch_source"] == "origin_head"
+
+
+class TestProtectedBranchesAreATrueUnion:
+    def test_a_decoy_adds_protection_rather_than_moving_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The union was documented and impossible: the resolver never looked at both.
+
+        For a declared project the discovered value was never read, so a decoy in
+        origin/HEAD could not add; for an undeclared one the declared value did not exist,
+        so the decoy REPLACED the protected branch. Both halves must now hold.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="main")
+        repo.git("update-ref", "refs/remotes/origin/decoy", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/decoy")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path), "defaultBranch": "main"}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["protected_branches"] == ["decoy", "main"], (
+            "the declared branch must survive a decoy, and the decoy must only add"
+        )

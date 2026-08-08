@@ -429,3 +429,164 @@ class TestGitVersionDiagnostic:
 
         with pytest.raises(UnsupportedGitVersionError, match=r"2\.26"):
             inspect_repository(repo.path)
+
+
+class TestSubmoduleConfigIsAudited:
+    """The audit must reach every config `git status` will read, not just the top one.
+
+    `git status --ignore-submodules=none` spawns a child `git status` inside every gitlinked
+    submodule, and that child reads the SUBMODULE's own .git/config. Auditing only the
+    superproject let a repository put a filter driver one directory down and have the
+    controller run it -- while the `-c` pins, which do propagate into the child, made the
+    other half of the defence look like it was working.
+    """
+
+    def _superproject_with_hostile_submodule(self, tmp_path: Path) -> tuple[Path, Path]:
+        marker = tmp_path / "EXECUTED"
+        payload = tmp_path / "payload.sh"
+        payload.write_text(
+            f"#!/bin/sh\necho ran >> {marker}\nprintf 'hello\\n'\n", encoding="utf-8"
+        )
+        payload.chmod(0o755)
+
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("a.txt", "hello\n")
+        inner.write(".gitattributes", "a.txt filter=pwn\n")
+        inner.commit_all("inner")
+        inner.git("config", "--local", "filter.pwn.clean", str(payload))
+
+        super_repo.write("top.txt", "top\n")
+        super_repo.git("add", "top.txt", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "super", check=False)
+        # A genuine, uncommitted divergence the hostile filter is designed to mask.
+        inner.write("a.txt", "world\n")
+        return super_repo.path, marker
+
+    def test_a_submodules_filter_driver_is_refused(self, tmp_path: Path) -> None:
+        root, marker = self._superproject_with_hostile_submodule(tmp_path)
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(root)
+
+        assert caught.value.details["keys"] == ["sub:filter.pwn.clean"], "must name where"
+        assert not marker.exists(), "the submodule's command ran during inspection"
+
+    def test_the_superproject_config_alone_never_showed_it(self, tmp_path: Path) -> None:
+        """Why the top-level audit could not have caught this: the key is not there."""
+        root, _ = self._superproject_with_hostile_submodule(tmp_path)
+        assert _repository_defined_command_config(GitRunner(root)) == []
+
+    def test_a_gitlink_that_is_not_checked_out_is_skipped(self, tmp_path: Path) -> None:
+        """A gitlink with no working tree has no config to read and no status to spawn."""
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("a.txt", "x")
+        inner.commit_all("inner")
+        super_repo.git("add", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+
+        import shutil
+
+        shutil.rmtree(super_repo.path / "sub")
+        inspect_repository(super_repo.path)  # must not raise
+
+    def test_an_ordinary_submodule_still_inspects(self, tmp_path: Path) -> None:
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("a.txt", "x")
+        inner.commit_all("inner")
+        super_repo.git("add", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+
+        assert inspect_repository(super_repo.path).status.is_clean
+
+    def test_a_submodule_whose_config_cannot_be_read_is_refused(self, tmp_path: Path) -> None:
+        """ "We could not look" must never read as "nothing to find".
+
+        Skipping was wrong twice over: `git status` descends regardless and fails there with
+        an untyped error, and the whole point of this audit is that a check which did not
+        run is not a pass.
+        """
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("f.txt", "x")
+        inner.commit_all("inner")
+        super_repo.git("add", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+
+        (inner.path / ".git" / "config").write_text("[core\nnot valid config\n", encoding="utf-8")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(super_repo.path)
+        assert caught.value.details["submodule"] == "sub"
+
+    def test_a_gitlinked_directory_that_is_not_a_repository_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """Git walks *up* from `-C`, so without the root check the child runner resolves
+        back to the superproject and audits it again, once per level, learning nothing."""
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("f.txt", "x")
+        inner.commit_all("inner")
+        super_repo.git("add", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+
+        import shutil
+
+        shutil.rmtree(inner.path / ".git")
+        inspect_repository(super_repo.path)  # must not raise, must not recurse
+
+    def test_nesting_is_bounded(self, tmp_path: Path) -> None:
+        """Depth-limited so a pathological tree cannot turn inspection into a long walk."""
+        from claude_away.adapters.git import _MAX_SUBMODULE_DEPTH
+
+        assert _MAX_SUBMODULE_DEPTH >= 2
+
+
+class TestSubmoduleReportingCannotBeSuppressed:
+    """`--ignore-submodules=none` is the only thing defeating `ignore = all`, and it was untested."""
+
+    def _dirty_submodule(self, tmp_path: Path, *, where: str) -> Path:
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("f.txt", "x")
+        inner.commit_all("inner")
+        super_repo.write(".gitmodules", '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+        super_repo.git("add", ".gitmodules", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+        inner.write("f.txt", "DIRTY")
+
+        if where == "gitmodules":
+            # A TRACKED file: this arrives through an ordinary commit or pull request, so it
+            # needs no access to .git at all.
+            super_repo.write(
+                ".gitmodules",
+                '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n',
+            )
+        else:
+            # The config form applies only to a *registered* submodule, which is what
+            # `git submodule init` produces.
+            super_repo.git("config", "submodule.sub.url", "./sub")
+            super_repo.git("config", "submodule.sub.ignore", "all")
+        return super_repo.path
+
+    @pytest.mark.parametrize("where", ["gitmodules", "config"])
+    def test_a_dirty_submodule_is_reported_despite_ignore_all(
+        self, tmp_path: Path, where: str
+    ) -> None:
+        root = self._dirty_submodule(tmp_path, where=where)
+
+        # Ground truth: without the flag, git really does stay silent.
+        quiet = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v2"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        assert "sub" not in quiet, "fixture did not actually suppress reporting"
+
+        status = inspect_repository(root).status
+        assert not status.is_clean
+        assert [m.path for m in status.dirty_submodules] == ["sub"]

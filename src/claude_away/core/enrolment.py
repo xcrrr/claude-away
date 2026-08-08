@@ -24,7 +24,7 @@ before anything is compared.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -72,8 +72,22 @@ class EnrolledRepository:
     root: Path
     """The canonical working-tree root. The identity everything downstream keys off."""
 
+    git_dir: Path
+    """Where Git actually keeps this repository's data. Usually ``<root>/.git`` -- but not
+    always, and the difference is a security boundary rather than trivia."""
+
+    common_dir: Path
+    """The shared object/ref store. Differs from ``git_dir`` only for a linked worktree."""
+
     default_branch: str | None
     """From configuration, or discovered locally. ``None`` means genuinely unknown."""
+
+    discovered_default_branch: str | None
+    """What the repository itself says, from ``refs/remotes/origin/HEAD``.
+
+    Carried even when the operator declared a different branch, so the protected set can be
+    the union of both and a decoy can only add protection rather than move it.
+    """
 
     default_branch_source: str | None
     """Which of those it was: ``"configured"`` or ``"origin_head"``.
@@ -88,8 +102,10 @@ class EnrolledRepository:
             "project_id": self.project_id,
             "configured_path": str(self.configured_path),
             "root": str(self.root),
+            "git_dir": str(self.git_dir),
             "default_branch": self.default_branch,
             "default_branch_source": self.default_branch_source,
+            "discovered_default_branch": self.discovered_default_branch,
         }
 
 
@@ -122,6 +138,16 @@ class Enrolment:
 
     repositories: tuple[EnrolledRepository, ...]
     failures: tuple[EnrolmentFailure, ...] = ()
+    inspections: Mapping[str, RepositoryInspection] = field(default_factory=dict)
+    """The inspection each repository was enrolled from, keyed by project id.
+
+    Kept so that a caller wanting to describe a repository does not have to inspect it a
+    second time. ``awayctl repos`` used to, passing the enrolment's *resolved* default
+    branch back in through the parameter reserved for the operator's declaration -- so a
+    value read out of ``refs/remotes/origin/HEAD`` came back stamped ``configured``, and the
+    JSON carried two contradictory provenance claims for one branch. Re-inspecting also
+    doubled the Git work, and every inspection is a chance to execute something.
+    """
 
     def by_id(self, project_id: str) -> EnrolledRepository:
         for repository in self.repositories:
@@ -156,6 +182,19 @@ class Enrolment:
         being able to write it means being able to choose a command that the deterministic
         controller then runs on its next inspection. Refusing it here closes that loop from
         the other side, so the guard does not rest on the Git adapter alone.
+
+        That refusal used to compare the first path component against the literal string
+        ``.git``, which is not the same question and missed two real cases. Git does not
+        require the directory to be called ``.git`` or to live at the root
+        (``git init --separate-git-dir``, and the ``gitdir:`` pointer file that submodules
+        and linked worktrees use), so a repository could simply move it -- and an agent with
+        ordinary write access to the working tree can do that with two file operations,
+        disarming the guard that constrains it. Nested repositories missed too: only the
+        *first* component was compared, so ``<root>/vendor/lib/.git/config`` sailed through.
+
+        The check now uses the real git directory and common directory, which inspection
+        already computed, and refuses a ``.git`` component anywhere in the path rather than
+        only at the front.
         """
         candidate = Path(path).expanduser().resolve()
 
@@ -173,12 +212,24 @@ class Enrolment:
                 enrolled=[str(r.root) for r in self.repositories],
             )
 
+        for store in (best.git_dir, best.common_dir):
+            if candidate == store or candidate.is_relative_to(store):
+                raise NotEnrolledError(
+                    "paths inside the git directory are never authorised; its config names "
+                    "commands that Git executes, so writing there is equivalent to choosing "
+                    "what the controller runs",
+                    path=str(candidate),
+                    project_id=best.project_id,
+                    git_dir=str(store),
+                )
+
         relative = candidate.relative_to(best.root)
-        if relative.parts and relative.parts[0] == ".git":
+        if ".git" in relative.parts:
+            # Covers a nested repository's own git directory, which is not this project's
+            # `git_dir` and would otherwise be authorised under the enclosing project.
             raise NotEnrolledError(
-                "paths inside the git directory are never authorised; .git/config names "
-                "commands that Git executes, so writing there is equivalent to choosing "
-                "what the controller runs",
+                "paths inside a git directory are never authorised, including one belonging "
+                "to a repository nested inside this one",
                 path=str(candidate),
                 project_id=best.project_id,
             )
@@ -244,8 +295,11 @@ def _enrol_one(
             project_id=project_id,
             configured_path=configured,
             root=inspection.root,
+            git_dir=inspection.git_dir,
+            common_dir=inspection.common_dir,
             default_branch=inspection.default_branch,
             default_branch_source=inspection.default_branch_source,
+            discovered_default_branch=inspection.discovered_default_branch,
         ),
         inspection,
     )
@@ -278,6 +332,7 @@ def enrol_projects(
     failures: list[EnrolmentFailure] = []
     by_root: dict[Path, str] = {}
     by_store: dict[Path, str] = {}
+    inspections: dict[str, RepositoryInspection] = {}
     # Failed projects still count for the state-database check below: not being enrollable
     # is no reason to let the ledger sit inside them.
     claimed_paths: list[Path] = []
@@ -301,7 +356,7 @@ def enrol_projects(
             claimed_paths.append(configured)
             continue
 
-        existing = by_root.get(repository.root)
+        existing = _lookup(by_root, repository.root)
         if existing is not None:
             # Different spellings -- a symlink, a `..` segment, a different mount path --
             # of one working tree. Locks and branch names are keyed by project id, so two
@@ -317,7 +372,7 @@ def enrol_projects(
         # ids over that share a branch namespace, so a branch created for one task is
         # visible and movable by the other, and `git checkout` of a branch already checked
         # out in the sibling fails outright. The shared store is what identifies them.
-        sharing = by_store.get(inspection.common_dir)
+        sharing = _lookup(by_store, inspection.common_dir)
         if sharing is not None:
             raise DuplicateEnrolmentError(
                 "two projects are linked worktrees of one repository; they share refs and "
@@ -329,11 +384,14 @@ def enrol_projects(
         by_root[repository.root] = repository.project_id
         by_store[inspection.common_dir] = repository.project_id
         claimed_paths.append(repository.root)
+        inspections[repository.project_id] = inspection
         enrolled.append(repository)
 
     _assert_state_db_outside_repositories(config, config_dir=config_dir, claimed=claimed_paths)
 
-    return Enrolment(repositories=tuple(enrolled), failures=tuple(failures))
+    return Enrolment(
+        repositories=tuple(enrolled), failures=tuple(failures), inspections=inspections
+    )
 
 
 def _assert_state_db_outside_repositories(
@@ -364,6 +422,32 @@ def _assert_state_db_outside_repositories(
                 state_db_path=str(state_path),
                 repository_root=str(root),
             )
+
+
+def _lookup(seen: Mapping[Path, str], candidate: Path) -> str | None:
+    """Find an already-seen path that is the same directory as ``candidate``.
+
+    A plain dict lookup compares strings, and the comment beside the duplicate check claimed
+    to cover "a different mount path" -- which it did not. Two bind mounts of one working
+    tree are two distinct canonical paths: `Path.resolve` collapses symlinks and `..`, but
+    a mount point is neither, so both keys missed and both projects enrolled. That is two
+    project ids over one tree and one ref namespace, which is precisely what
+    :class:`~claude_away.errors.DuplicateEnrolmentError` exists to prevent. The same gap
+    covers a case-insensitive filesystem, where two spellings name one directory.
+
+    The dict lookup stays as the fast path; `samefile` settles the rest by asking the
+    filesystem instead of comparing text.
+    """
+    direct = seen.get(candidate)
+    if direct is not None:
+        return direct
+    for path, project_id in seen.items():
+        try:
+            if path.exists() and candidate.exists() and path.samefile(candidate):
+                return project_id
+        except OSError:  # pragma: no cover - racing filesystem
+            continue
+    return None
 
 
 def _is_inside(candidate: Path, root: Path) -> bool:

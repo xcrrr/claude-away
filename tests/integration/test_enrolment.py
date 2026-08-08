@@ -585,3 +585,108 @@ class TestStateDbBoundaryUsesFilesystemIdentity:
         from claude_away.core.enrolment import _is_inside
 
         assert not _is_inside(tmp_path / "a" / "b.db", tmp_path / "gone")
+
+
+class TestTheGitDirectoryGuardUsesTheRealGitDirectory:
+    """The guard checked the literal name `.git`, which is a different question."""
+
+    def test_a_relocated_git_directory_is_still_refused(self, tmp_path: Path) -> None:
+        """Self-disarming otherwise: two file operations remove the constraint.
+
+        Git does not require the directory to be called `.git` or to sit at the root. An
+        agent with ordinary write access to the working tree -- exactly what M2B grants --
+        could `mv .git .store` plus a `gitdir:` pointer, and the guard that stops it choosing
+        what the controller executes would permit writing config and hooks again.
+        """
+        repo = make_repo(tmp_path / "api")
+        real = repo.path / ".git"
+        moved = repo.path / ".store"
+        real.rename(moved)
+        (repo.path / ".git").write_text(f"gitdir: {moved}\n", encoding="utf-8")
+
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]), config_dir=tmp_path
+        )
+        with pytest.raises(NotEnrolledError, match="git directory"):
+            enrolment.require_path(moved / "config")
+
+    def test_a_nested_repositorys_git_directory_is_refused(self, tmp_path: Path) -> None:
+        """Only the FIRST component was compared, so `vendor/lib/.git/config` sailed through."""
+        outer = make_repo(tmp_path / "outer")
+        make_repo(outer.path / "vendor" / "lib")
+
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "outer", "path": str(outer.path)}]), config_dir=tmp_path
+        )
+        for relative in (
+            "vendor/lib/.git",
+            "vendor/lib/.git/config",
+            "vendor/lib/.git/hooks/pre-commit",
+        ):
+            with pytest.raises(NotEnrolledError, match="git directory"):
+                enrolment.require_path(outer.path / relative)
+
+    def test_ordinary_nested_files_are_still_authorised(self, tmp_path: Path) -> None:
+        outer = make_repo(tmp_path / "outer")
+        (outer.path / "vendor").mkdir()
+        assert (
+            enrol_projects(
+                config_for(tmp_path, [{"id": "outer", "path": str(outer.path)}]),
+                config_dir=tmp_path,
+            )
+            .require_path(outer.path / "vendor" / "notes.md")
+            .project_id
+            == "outer"
+        )
+
+
+class TestDuplicateDetectionUsesFilesystemIdentity:
+    def test_two_spellings_of_one_tree_are_refused(self, tmp_path: Path) -> None:
+        """`by_root` was a dict lookup, so only identical strings collided.
+
+        The comment beside it claimed to cover "a different mount path". `Path.resolve`
+        collapses symlinks and `..` -- a mount point is neither, so two bind mounts of one
+        working tree enrolled as two projects over one ref namespace. Bind mounts cannot be
+        created here; a symlinked *root* passed unresolved exercises the same comparison.
+        """
+        from claude_away.core.enrolment import _lookup
+
+        real = tmp_path / "repo"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+
+        seen = {alias: "first"}
+        assert alias not in {real}  # the string comparison genuinely misses
+        assert _lookup(seen, real) == "first"
+
+    def test_an_unrelated_path_is_not_a_duplicate(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _lookup
+
+        first = tmp_path / "a"
+        second = tmp_path / "b"
+        first.mkdir()
+        second.mkdir()
+        assert _lookup({first: "one"}, second) is None
+
+    def test_a_missing_path_does_not_crash_the_lookup(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _lookup
+
+        assert _lookup({tmp_path / "gone": "x"}, tmp_path / "also-gone") is None
+
+
+class TestEnrolmentKeepsItsInspections:
+    def test_the_inspection_is_available_without_a_second_one(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]), config_dir=tmp_path
+        )
+        assert enrolment.inspections["api"].root == repo.path.resolve()
+
+    def test_a_failed_project_has_no_inspection(self, tmp_path: Path) -> None:
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(plain)}]), config_dir=tmp_path
+        )
+        assert "api" not in enrolment.inspections
