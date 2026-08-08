@@ -702,9 +702,14 @@ class Database:
 
         Per-migration history is preserved -- each migration still writes its own
         ``schema_migrations`` row, so the ledger records what was applied and when.
-        Atomicity is unchanged: the schema change and its ledger row commit together, and a
-        crash mid-migration leaves the database at the previous version rather than
-        partially upgraded.
+
+        Atomicity is now *batch*-wide, which is stronger than what it replaced and worth
+        stating precisely rather than describing as "unchanged". Every pending migration
+        runs inside the one transaction, so a crash while applying migration 3 of a 1..3
+        batch rolls the database back to the version it started at -- not to 2. A partially
+        upgraded schema is still impossible, which is the property that matters; the
+        difference only becomes observable once a second migration exists, and the honest
+        description is the one that will still be true then.
         """
         # Named outside the block so a failure can say which migration was in flight.
         in_flight: tuple[int, str] | None = None

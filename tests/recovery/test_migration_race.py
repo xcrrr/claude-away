@@ -21,6 +21,7 @@ The assertion -- every opener must succeed -- does not depend on timing.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -30,6 +31,7 @@ from typing import Any
 import pytest
 
 from claude_away.core.db import SCHEMA_VERSION, Database, open_database
+from claude_away.errors import MigrationError
 
 _RENDEZVOUS_TIMEOUT = 30
 
@@ -171,3 +173,48 @@ class TestSequentialMigrationStillWorks:
         with pytest.raises(SchemaVersionError) as caught:
             open_database(db_path)
         assert caught.value.details["found"] == 999
+
+
+class TestLedgerFailureIsTyped:
+    """The half of the migrate() fix that was claimed without a test behind it.
+
+    `_ensure_migration_ledger()` was moved inside the error boundary so a `database is
+    locked` during its DDL surfaces as a MigrationError rather than a bare
+    sqlite3.OperationalError. Moving it back out left the suite green -- the same
+    claim-without-evidence pattern the correction section exists to eliminate.
+    """
+
+    def test_a_locked_database_during_ledger_creation_is_a_migration_error(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "state.db"
+
+        # Take an exclusive write lock from an unrelated connection and hold it. No sleeps:
+        # the lock is held for the whole of the call under test.
+        blocker = sqlite3.connect(path)
+        blocker.execute("PRAGMA journal_mode = WAL")
+        blocker.execute("BEGIN EXCLUSIVE")
+        try:
+            database = Database(path, busy_timeout_ms=50)
+            with pytest.raises(MigrationError) as caught:
+                database.migrate()
+            assert "locked" in str(caught.value).lower()
+            database.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+    def test_the_same_database_migrates_once_the_lock_is_released(self, tmp_path: Path) -> None:
+        """The refusal is about contention, not about the database being broken."""
+        path = tmp_path / "state.db"
+        blocker = sqlite3.connect(path)
+        blocker.execute("PRAGMA journal_mode = WAL")
+        blocker.execute("BEGIN EXCLUSIVE")
+        database = Database(path, busy_timeout_ms=50)
+        with pytest.raises(MigrationError):
+            database.migrate()
+        blocker.rollback()
+        blocker.close()
+
+        assert database.migrate() == SCHEMA_VERSION
+        database.close()

@@ -396,13 +396,26 @@ must converge) does not depend on timing.
 
 The version check and the migrations it gates now share one `BEGIN IMMEDIATE`
 transaction. A second opener cannot read the version until the first has committed, so it
-sees the new version and skips. Per-migration ledger rows and per-migration atomicity are
-unchanged, and `_ensure_migration_ledger()` moved inside the error boundary so that a
-`database is locked` during its DDL surfaces as a `MigrationError` rather than a bare
+sees the new version and skips. Per-migration ledger rows are unchanged — each migration
+still writes its own `schema_migrations` row.
+
+Atomicity is *not* unchanged, and an earlier version of this section said it was. Every
+pending migration now runs inside one transaction, so a crash while applying migration 3 of
+a 1..3 batch rolls back to the starting version rather than to 2. That is a stronger
+property, not a weaker one, and it is unobservable today because there is a single
+migration — which is exactly why the inaccurate sentence survived. It is corrected here
+rather than left to become wrong the first time a second migration lands.
+
+`_ensure_migration_ledger()` also moved inside the error boundary so that a `database is
+locked` during its DDL surfaces as a `MigrationError` rather than a bare
 `sqlite3.OperationalError`.
 
 Regression: `tests/recovery/test_migration_race.py`, verified to **fail** against the
 pre-fix implementation (`git show origin/main:src/claude_away/core/db.py`) and pass after.
+The ledger relocation is covered separately by
+`TestLedgerFailureIsTyped::test_a_locked_database_during_ledger_creation_is_a_migration_error`
+— it was claimed in the original commit message with no test behind it, which is precisely
+the pattern the process lesson below was written about.
 
 ### The process lesson
 

@@ -139,9 +139,14 @@ awayctl status               # show the plan
 awayctl doctor               # check the state for problems
 awayctl gate AWAY-0001       # explain why a task can or cannot be completed
 
-# read-only inspection of the repositories you enrolled
-awayctl repos  --config examples/config.example.json
-awayctl policy --config examples/config.example.json
+# the allow/deny matrix for a configuration — reads no repositories
+awayctl policy examples/config.example.json
+
+# read-only inspection of the repositories you enrolled. Copy the example first and
+# point `projects[].path` at repositories that exist on your machine: the shipped
+# example names /home/you/code/api, so this refuses until you edit it.
+cp examples/config.example.json my-config.json
+awayctl repos my-config.json
 ```
 
 Every command also takes `--json`, because an unattended supervisor should never have to

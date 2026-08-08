@@ -234,8 +234,12 @@ class TestUnsupportedRepositories:
         subprocess.run(
             ["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True, timeout=60
         )
-        with pytest.raises(UnsupportedRepositoryError, match="bare"):
+        # Asserting on `.message`, not on `str(exception)`: the latter includes the path,
+        # and the fixture directory is called "bare.git", so `match="bare"` passed even with
+        # the bare-repository guard removed entirely.
+        with pytest.raises(UnsupportedRepositoryError) as caught:
             inspect_repository(bare)
+        assert "bare repositories are not supported" in caught.value.message
 
     def test_plain_directory_is_refused(self, tmp_path: Path) -> None:
         plain = tmp_path / "not-a-repo"
@@ -265,15 +269,51 @@ class TestEnvironmentIsolation:
         assert inspection.root == target.path.resolve()
         assert inspection.head_commit == target.head()
 
-    def test_git_config_environment_is_ignored(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("variable", ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"])
+    def test_a_hostile_config_file_in_the_environment_cannot_run_anything(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str
     ) -> None:
+        """This test used to prove nothing, which is how the real gap survived review.
+
+        It pointed `GIT_CONFIG` at a file setting `core.pager`. Neither half could fire:
+        since Git 2.32 `GIT_CONFIG` affects only the `git config` command, and a pager is
+        never invoked when stdout is captured. Deleting the variable from the strip list
+        left the suite green. The variables below genuinely do inject executable config,
+        and the payload is one whose execution leaves a mark.
+        """
+        marker = tmp_path / "EXECUTED"
+        hook = tmp_path / "hook.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+
         hostile = tmp_path / "hostile.gitconfig"
-        hostile.write_text("[core]\n\tpager = touch /tmp/pwned\n", encoding="utf-8")
-        monkeypatch.setenv("GIT_CONFIG", str(hostile))
+        hostile.write_text(f"[core]\n\tfsmonitor = {hook}\n", encoding="utf-8")
+        monkeypatch.setenv(variable, str(hostile))
 
         repo = make_repo(tmp_path / "r")
-        assert inspect_repository(repo.path).status.is_clean
+        inspect_repository(repo.path)
+        assert not marker.exists()
+
+    def test_the_forced_environment_reaches_git(self, tmp_path: Path) -> None:
+        """Each forced variable carries a written justification; none had a test.
+
+        `environment.update(_FORCED_ENV)` could be deleted with the suite green, and the
+        one that matters -- GIT_TERMINAL_PROMPT=0 -- is the difference between a failed
+        fetch and an unattended run hanging on a credential prompt forever.
+        """
+        from claude_away.adapters.git import _FORCED_ENV
+
+        repo = make_repo(tmp_path / "r")
+        environment = GitRunner(repo.path)._environment()
+        for key, value in _FORCED_ENV.items():
+            assert environment[key] == value, key
+
+    def test_an_inherited_terminal_prompt_setting_is_overridden(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = make_repo(tmp_path / "r")
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+        assert GitRunner(repo.path)._environment()["GIT_TERMINAL_PROMPT"] == "0"
 
 
 class TestRefSafety:

@@ -144,6 +144,39 @@ class TestRefusals:
         refusals = set(resolve(repo.path).refusals)
         assert {BaseRefusal.DETACHED_HEAD, BaseRefusal.DIRTY_WORKTREE} <= refusals
 
+    def test_dirty_submodule_refuses(self, tmp_path: Path) -> None:
+        """The one declared refusal with no test: deleting the branch left the suite green.
+
+        Today it is masked -- git reports a dirty submodule as an unstaged parent entry, so
+        DIRTY_WORKTREE fires anyway -- but a change to `--ignore-submodules` handling or to
+        the parser would separate the two and nothing would notice.
+        """
+        outer = make_repo(tmp_path / "outer")
+        inner = make_repo(tmp_path / "inner")
+        outer.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(inner.path),
+            "vendor/inner",
+            check=False,
+        )
+        outer.commit_all("add submodule")
+        (outer.path / "vendor" / "inner" / "scratch.txt").write_text("x", encoding="utf-8")
+
+        inspection = inspect_repository(outer.path, configured_default_branch="main")
+        if not inspection.status.dirty_submodules:  # pragma: no cover - submodule setup varies
+            import pytest
+
+            pytest.skip("this git build did not report the submodule as dirty")
+
+        resolution = resolve_expected_base(inspection, project_id="outer")
+        assert not resolution.resolved
+        assert BaseRefusal.DIRTY_SUBMODULES in resolution.refusals
+        assert resolution.detail["dirty_submodules"] == ["vendor/inner"]
+
     def test_refusal_serialises_for_the_supervisor(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "r")
         repo.write("dirty.txt", "x")

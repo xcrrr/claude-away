@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
-    "BaseRevisionError",
     "ClaudeAwayError",
     "DagError",
     "DatabaseError",
@@ -482,12 +481,6 @@ class UnsafeStateLocationError(EnrolmentError):
     """The state database would live inside an enrolled repository."""
 
     code = "unsafe_state_location"
-
-
-class BaseRevisionError(ClaudeAwayError):
-    """The expected base revision could not be established unambiguously."""
-
-    code = "base_revision_unresolved"
 
 
 # --------------------------------------------------------------------------------------
