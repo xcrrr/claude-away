@@ -362,6 +362,47 @@ class TestPathsSurviveInspection:
         assert RepositoryOperation.MERGE in inspection.operations_in_progress
 
 
+class TestTheAuditFailsClosed:
+    """An audit that did not run must never read as "found nothing"."""
+
+    def test_a_git_without_show_scope_refuses_rather_than_skipping_the_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This was a fail-open in the fix for the fail-open.
+
+        `git config --list --show-scope` needs Git 2.26. On anything older the call exited
+        129, the audit returned "no offending keys", and every hostile repository was
+        accepted -- with the rest of the hardening in place, which made it look protected.
+        """
+        repo = make_repo(tmp_path / "r")
+        repo.git("config", "filter.evil.clean", "/bin/true")
+
+        shim_dir = tmp_path / "oldgit"
+        shim_dir.mkdir()
+        real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        shim = shim_dir / "git"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'for a in "$@"; do\n'
+            '  case "$a" in --show-scope)\n'
+            '    echo "error: unknown option \\`show-scope\'" >&2; exit 129;;\n'
+            "  esac\n"
+            "done\n"
+            f'exec {real_git} "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+
+        with pytest.raises(UnsupportedGitVersionError, match=r"2\.26"):
+            inspect_repository(repo.path)
+
+    def test_a_repository_with_no_configuration_at_all_is_not_refused(self, tmp_path: Path) -> None:
+        """Exit 1 with no output means "nothing to list", which is not a failure."""
+        repo = make_repo(tmp_path / "r")
+        assert _repository_defined_command_config(GitRunner(repo.path)) == []
+
+
 class TestGitVersionDiagnostic:
     def test_an_option_this_build_needs_is_reported_as_a_version_problem(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

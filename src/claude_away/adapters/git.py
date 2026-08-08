@@ -524,11 +524,29 @@ def _repository_defined_command_config(runner: GitRunner) -> list[str]:
     told "this repository is unsafe" and not told which key would have to go looking.
     """
     completed = runner.run("config", "--list", "--show-scope", "-z", check=False)
-    if completed.returncode != 0:
-        # No configuration to read is not an error here: `rev-parse` has already established
-        # that this is a working tree, and a repository with no config entries at all is
-        # simply one with nothing to refuse.
+    if completed.returncode == 1 and not completed.stdout:
+        # `git config --list` exits 1 when there is genuinely nothing to list. `rev-parse`
+        # has already established this is a working tree, so a repository with no config
+        # entries at all is simply one with nothing to refuse.
         return []
+    if completed.returncode != 0:
+        # Anything else means the audit did not run, and an audit that did not run must
+        # never read as "found nothing" -- that is the failure mode this whole function
+        # exists to prevent, and returning [] here reintroduced it one level up. A Git
+        # without `--show-scope` exits 129, and silently accepted every hostile repository.
+        stderr = completed.stderr.decode("utf-8", "replace")
+        if "unknown option" in stderr or "unknown switch" in stderr:
+            raise UnsupportedGitVersionError(
+                f"git {MINIMUM_GIT_VERSION} or newer is required: this build cannot check "
+                f"whether the repository's configuration names commands Git would execute, "
+                f"and will not inspect a repository it cannot check",
+                stderr=stderr[:_MAX_STDERR_CHARS],
+            )
+        raise GitCommandError(
+            list(completed.args),
+            completed.returncode,
+            stderr[:_MAX_STDERR_CHARS],
+        )
 
     # With `-z` the stream is a flat sequence of NUL-terminated fields that alternate
     # `<scope>` and `<key>\n<value>` -- *not* one NUL-separated record per entry. Getting
