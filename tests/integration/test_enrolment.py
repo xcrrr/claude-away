@@ -87,22 +87,29 @@ class TestPathRejection:
             )
 
     def test_directory_that_is_not_a_repository(self, tmp_path: Path) -> None:
+        """Recorded as a failure, not raised: it disables that project, not the run."""
         plain = tmp_path / "plain"
         plain.mkdir()
-        with pytest.raises(NotAGitRepositoryError):
-            enrol_projects(
-                config_for(tmp_path, [{"id": "api", "path": str(plain)}]), config_dir=tmp_path
-            )
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(plain)}]), config_dir=tmp_path
+        )
+        assert enrolment.repositories == ()
+        assert isinstance(enrolment.failures[0].error, NotAGitRepositoryError)
+        with pytest.raises(NotEnrolledError):
+            enrolment.by_id("api")
 
     def test_bare_repository_is_refused(self, tmp_path: Path) -> None:
         bare = tmp_path / "bare.git"
         subprocess.run(
             ["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True, timeout=60
         )
-        with pytest.raises(UnsupportedRepositoryError, match="bare"):
-            enrol_projects(
-                config_for(tmp_path, [{"id": "api", "path": str(bare)}]), config_dir=tmp_path
-            )
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(bare)}]), config_dir=tmp_path
+        )
+        assert enrolment.repositories == ()
+        error = enrolment.failures[0].error
+        assert isinstance(error, UnsupportedRepositoryError)
+        assert "bare" in error.message
 
     def test_subdirectory_does_not_silently_widen_to_the_repository(self, tmp_path: Path) -> None:
         """The scope-widening case.
@@ -207,7 +214,7 @@ class TestStateDatabaseLocation:
                 ),
                 config_dir=tmp_path,
             )
-        assert caught.value.details["project_id"] == "api"
+        assert caught.value.details["repository_root"] == str(repo.path.resolve())
 
     def test_state_db_equal_to_the_repository_root_is_refused(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "api")
@@ -414,3 +421,130 @@ class TestConfiguredDefaultBranch:
             config_dir=tmp_path,
         )
         assert enrolment.by_id("api").default_branch in {None, "main"}
+
+
+class TestNestedEnrolmentIsResolvedBySpecificity:
+    """Two legitimately enrolled repositories can nest. Which one owns a path?"""
+
+    def _nested(self, tmp_path: Path) -> tuple[Path, Path]:
+        outer = make_repo(tmp_path / "outer")
+        inner = make_repo(outer.path / "vendor" / "inner")
+        return outer.path, inner.path
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_the_innermost_repository_wins_regardless_of_config_order(
+        self, tmp_path: Path, reverse: bool
+    ) -> None:
+        """The answer must not depend on how the configuration file happens to be written.
+
+        Returning the first match made this order-dependent: the same path on the same
+        filesystem was authorised as `outer` or as `inner` depending on which entry came
+        first. Locks, leases and branch names are keyed by project id, so that is two
+        different exclusive claims over one tree.
+        """
+        outer, inner = self._nested(tmp_path)
+        projects = [
+            {"id": "outer", "path": str(outer)},
+            {"id": "inner", "path": str(inner)},
+        ]
+        if reverse:
+            projects.reverse()
+
+        enrolment = enrol_projects(config_for(tmp_path, projects), config_dir=tmp_path)
+        assert enrolment.require_path(inner / "file.txt").project_id == "inner"
+
+    def test_a_path_outside_the_inner_repository_still_belongs_to_the_outer(
+        self, tmp_path: Path
+    ) -> None:
+        outer, inner = self._nested(tmp_path)
+        enrolment = enrol_projects(
+            config_for(
+                tmp_path,
+                [{"id": "outer", "path": str(outer)}, {"id": "inner", "path": str(inner)}],
+            ),
+            config_dir=tmp_path,
+        )
+        assert enrolment.require_path(outer / "src" / "app.py").project_id == "outer"
+
+
+class TestGitDirectoryIsNeverAuthorised:
+    """`.git/config` names commands Git executes; writing it chooses what we run."""
+
+    @pytest.mark.parametrize(
+        "relative",
+        [".git", ".git/config", ".git/hooks/pre-commit", ".git/objects/ab/cdef"],
+    )
+    def test_paths_inside_the_git_directory_are_refused(
+        self, tmp_path: Path, relative: str
+    ) -> None:
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]), config_dir=tmp_path
+        )
+        with pytest.raises(NotEnrolledError, match="git directory"):
+            enrolment.require_path(repo.path / relative)
+
+    def test_an_ordinary_path_is_still_authorised(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]), config_dir=tmp_path
+        )
+        assert enrolment.require_path(repo.path / "src" / "app.py").project_id == "api"
+
+    def test_a_file_merely_named_gitignore_is_not_the_git_directory(self, tmp_path: Path) -> None:
+        """Component-wise, not prefix: `.gitignore` is an ordinary tracked file."""
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]), config_dir=tmp_path
+        )
+        assert enrolment.require_path(repo.path / ".gitignore").project_id == "api"
+
+
+class TestLinkedWorktrees:
+    def test_two_linked_worktrees_of_one_repository_are_refused(self, tmp_path: Path) -> None:
+        """Different roots, one ref namespace.
+
+        `git worktree add` gives a repository a second working tree: same objects, same
+        refs, same config. Two project ids over that share a branch namespace, so a branch
+        created for one task is the same branch the other can move -- and a checkout of a
+        branch already checked out in the sibling fails outright.
+        """
+        main = make_repo(tmp_path / "main")
+        linked = tmp_path / "linked"
+        main.git("worktree", "add", "-q", str(linked), "-b", "side")
+
+        with pytest.raises(DuplicateEnrolmentError, match="linked worktrees"):
+            enrol_projects(
+                config_for(
+                    tmp_path,
+                    [
+                        {"id": "main", "path": str(main.path)},
+                        {"id": "side", "path": str(linked)},
+                    ],
+                ),
+                config_dir=tmp_path,
+            )
+
+    def test_either_worktree_alone_enrols_normally(self, tmp_path: Path) -> None:
+        main = make_repo(tmp_path / "main")
+        linked = tmp_path / "linked"
+        main.git("worktree", "add", "-q", str(linked), "-b", "side")
+
+        for project_id, path in (("main", main.path), ("side", linked)):
+            enrolment = enrol_projects(
+                config_for(tmp_path, [{"id": project_id, "path": str(path)}]),
+                config_dir=tmp_path,
+            )
+            assert enrolment.by_id(project_id).root == path.resolve()
+
+    def test_two_genuinely_separate_repositories_are_unaffected(self, tmp_path: Path) -> None:
+        first = make_repo(tmp_path / "api")
+        second = make_repo(tmp_path / "web")
+        enrolment = enrol_projects(
+            config_for(
+                tmp_path,
+                [{"id": "api", "path": str(first.path)}, {"id": "web", "path": str(second.path)}],
+            ),
+            config_dir=tmp_path,
+        )
+        assert len(enrolment.repositories) == 2

@@ -16,14 +16,36 @@ a flag", so a ref beginning with ``-`` is rejected before it reaches argv and ``
 to end option parsing wherever Git supports it. Otherwise a branch literally named
 ``--upload-pack=evil`` is an argument the porcelain will happily honour.
 
-**A sanitised environment.** ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_CONFIG`` and friends
-silently redirect Git at a different repository than the one in ``-C``. They are stripped,
-along with anything that could make Git prompt or open a network connection.
+**A sanitised environment.** ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_CONFIG_PARAMETERS`` and
+friends silently redirect Git at a different repository, or inject arbitrary configuration,
+regardless of what ``-C`` says. The whole ``GIT_*`` namespace is therefore removed and only
+the handful of variables in :data:`_FORCED_ENV` are put back. Deny-by-default, because Git
+keeps adding variables and a hand-maintained list of the dangerous ones is a list that is
+one release out of date.
 
 **Refuse rather than guess.** Output this build cannot parse raises
 :class:`~claude_away.errors.GitOutputError`. A status parser that skips an entry it does
 not recognise reports a dirty repository as clean, and "clean" is the answer that gets
 somebody else's uncommitted work built on top of.
+
+**A repository's own configuration is not trusted.** This one is easy to miss, and it is
+the reason ``read-only`` was in scare quotes until Milestone 2A's review. Several Git
+configuration keys hold *commands that Git executes*, and ``git status`` is enough to fire
+them: ``core.fsmonitor`` runs on every invocation, and a ``filter.<driver>.clean`` runs
+whenever a tracked file's content has to be examined. A repository is data that Claude Away
+is pointed at -- and in Milestone 2B it is data Claude itself can write -- so honouring
+those keys would mean the deterministic controller executes code chosen by the thing it is
+supposed to be supervising. Worse than the execution: an ``fsmonitor`` hook decides *what
+Git thinks changed*, so a hostile one makes a modified worktree report clean, which is
+precisely the guard :mod:`claude_away.core.base_revision` exists to provide.
+
+Two defences, because neither is sufficient alone. Keys that name a command and have a
+fixed name are pinned on every invocation via ``-c`` (highest precedence, so the
+repository's value never applies). Keys that cannot be pinned because the name is
+user-chosen -- ``filter.*``, ``diff.*``, ``merge.*`` -- are audited before the first command
+that could trigger them, and a repository that sets one *in its own config* is refused.
+Scope matters there: the operator's global configuration is trusted (that is where
+``git lfs install`` puts its filters), the repository's is not.
 """
 
 from __future__ import annotations
@@ -39,6 +61,7 @@ from claude_away.errors import (
     GitCommandError,
     GitOutputError,
     NotAGitRepositoryError,
+    UnsafeRepositoryConfigError,
     UnsupportedRepositoryError,
 )
 
@@ -59,32 +82,15 @@ GIT_TIMEOUT_SECONDS = 60
 
 _MAX_STDERR_CHARS = 2_000
 
-# Environment variables that redirect Git at a different repository, a different config, or
-# an interactive/network path. Cleared for every invocation so that inspection describes the
-# repository we were pointed at and nothing else.
-_STRIPPED_ENV = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_COUNT",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_ALTERNATE_REFS",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_PAGER",
-    "GIT_EDITOR",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_PROXY_COMMAND",
-    "GIT_ASKPASS",
-    "SSH_ASKPASS",
-)
+# Deny-by-default over the whole GIT_* namespace. An enumerated list of dangerous variables
+# was the previous design and it leaked: GIT_CONFIG_PARAMETERS was missing, and it alone is
+# enough to inject any configuration key -- including one that names a command to run -- into
+# every "read-only" call. Removing the namespace wholesale means the next variable Git adds
+# is handled before anybody hears about it.
+_STRIPPED_ENV_PREFIXES = ("GIT_",)
+
+# Non-GIT_ variables that steer Git into an interactive or network path.
+_STRIPPED_ENV = ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")
 
 _FORCED_ENV = {
     # Never prompt: an unattended run that blocks on a credential prompt is a hang.
@@ -96,6 +102,59 @@ _FORCED_ENV = {
     "LC_ALL": "C",
     "LANG": "C",
 }
+
+# Configuration keys whose values Git executes as commands, pinned on every invocation.
+# `-c` outranks system, global and repository configuration, so whatever the repository (or
+# the operator) has set for these does not apply to our calls.
+#
+# `core.fsmonitor` is the one that matters most and is not optional: besides running a
+# command, it decides what Git reports as changed, so a repository could otherwise make
+# itself look clean. The rest are pinned because they cost nothing and remove a whole class
+# of "does `git <verb>` reach this key?" reasoning that would have to be redone for every
+# command added later.
+_PINNED_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.pager", "cat"),
+    ("core.editor", "false"),
+    ("core.sshCommand", "false"),
+    ("core.askPass", ""),
+    ("core.gitProxy", ""),
+    ("core.alternateRefsCommand", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("gpg.program", "false"),
+    ("uploadpack.packObjectsHook", ""),
+    ("protocol.ext.allow", "never"),
+)
+
+# Command-bearing keys whose middle component is user-chosen, so `-c` cannot pin them: there
+# is no key to override until you know the driver's name. These are audited instead, and a
+# repository that sets one in its *own* configuration is refused.
+#
+# Matched case-insensitively against `git config --list --show-scope`, which lower-cases
+# section and key while preserving the middle component verbatim.
+_UNPINNABLE_COMMAND_KEYS: tuple[tuple[str, str], ...] = (
+    ("filter.", ".clean"),
+    ("filter.", ".smudge"),
+    ("filter.", ".process"),
+    ("diff.", ".textconv"),
+    ("diff.", ".command"),
+    ("diff.", ".external"),
+    ("merge.", ".driver"),
+    ("trailer.", ".command"),
+    ("trailer.", ".cmd"),
+    # `gpg.<format>.program` and `credential.<url>.helper` take a middle component too, so
+    # pinning the bare `gpg.program` / `credential.helper` does not cover them.
+    ("gpg.", ".program"),
+    ("credential.", ".helper"),
+)
+
+# Scopes that the repository itself controls. `git config --list --show-scope` reports
+# `system`, `global`, `local`, `worktree` and `command`; only the middle two live inside the
+# repository and can therefore be written by a checkout, an unpacked archive, or -- the case
+# this project has to assume -- Claude working in the repository.
+_UNTRUSTED_CONFIG_SCOPES = frozenset({"local", "worktree"})
 
 
 class RepositoryOperation(str, Enum):
@@ -171,6 +230,11 @@ class RepositoryInspection:
 
     root: Path
     git_dir: Path
+    common_dir: Path
+    """The shared object/ref store. Differs from ``git_dir`` only for a linked worktree,
+    which is exactly why it is recorded: two linked worktrees are two working trees over
+    one ref namespace, and only this value says so."""
+
     head_commit: str | None
     """``None`` on an unborn branch -- a fresh ``git init`` with no commit yet."""
 
@@ -181,6 +245,9 @@ class RepositoryInspection:
     status: WorktreeStatus
     operations_in_progress: tuple[RepositoryOperation, ...]
     default_branch: str | None
+    default_branch_source: str | None
+    """``"configured"``, ``"origin_head"``, or ``None``. Who said so, not just what."""
+
     remotes: tuple[str, ...]
 
     @property
@@ -190,11 +257,13 @@ class RepositoryInspection:
     def to_dict(self) -> dict[str, Any]:
         return {
             "root": str(self.root),
+            "common_dir": str(self.common_dir),
             "head_commit": self.head_commit,
             "branch": self.branch,
             "detached": self.is_detached,
             "unborn": self.is_unborn,
             "default_branch": self.default_branch,
+            "default_branch_source": self.default_branch_source,
             "remotes": list(self.remotes),
             "operations_in_progress": [op.value for op in self.operations_in_progress],
             "status": self.status.to_dict(),
@@ -230,7 +299,11 @@ class GitRunner:
         self.timeout = timeout
 
     def _environment(self) -> dict[str, str]:
-        environment = {key: value for key, value in os.environ.items() if key not in _STRIPPED_ENV}
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _STRIPPED_ENV and not key.startswith(_STRIPPED_ENV_PREFIXES)
+        }
         environment.update(_FORCED_ENV)
         return environment
 
@@ -238,13 +311,19 @@ class GitRunner:
         """Invoke Git with the given arguments.
 
         ``-C`` rather than ``cwd=`` so the target is explicit in the recorded argv, and
-        ``--no-optional-locks`` so inspection never contends with a human's shell.
+        ``--no-optional-locks`` so inspection never contends with a human's shell. The
+        pinned ``-c`` overrides come before the subcommand because that is the only position
+        Git accepts them in, and they outrank every configuration file.
         """
         for argument in arguments:
             if "\x00" in argument:
                 raise GitOutputError("git argument contains a NUL byte", argument=argument)
 
-        argv = ["git", "-C", str(self.cwd), "--no-optional-locks", *arguments]
+        pinned: list[str] = []
+        for key, value in _PINNED_CONFIG:
+            pinned += ["-c", f"{key}={value}"]
+
+        argv = ["git", "-C", str(self.cwd), "--no-optional-locks", *pinned, *arguments]
         try:
             completed = subprocess.run(
                 argv,
@@ -381,6 +460,60 @@ def _parse_porcelain_v2(payload: bytes) -> WorktreeStatus:
     )
 
 
+def _repository_defined_command_config(runner: GitRunner) -> list[str]:
+    """Names of command-bearing configuration keys the *repository* sets for itself.
+
+    ``git config --list`` executes nothing -- it reads files -- so this is safe to run
+    before the commands that would fire a hook. ``--show-scope`` is what makes the check
+    usable rather than merely strict: ``git lfs install`` writes ``filter.lfs.clean`` to the
+    operator's global configuration, and refusing every LFS repository would be a bug, not a
+    safeguard. Only ``local`` and ``worktree`` scope is the repository speaking.
+
+    Returns the offending key names so the caller can name them in the refusal. An operator
+    told "this repository is unsafe" and not told which key would have to go looking.
+    """
+    completed = runner.run("config", "--list", "--show-scope", "-z", check=False)
+    if completed.returncode != 0:
+        # No configuration to read is not an error here: `rev-parse` has already established
+        # that this is a working tree, and a repository with no config entries at all is
+        # simply one with nothing to refuse.
+        return []
+
+    # With `-z` the stream is a flat sequence of NUL-terminated fields that alternate
+    # `<scope>` and `<key>\n<value>` -- *not* one NUL-separated record per entry. Getting
+    # this wrong parses cleanly and finds nothing, which is the failure mode a security
+    # check must not have, so `test_the_audit_parses_real_git_output` pins it against the
+    # bytes real Git emits rather than against a fixture written from this description.
+    fields = completed.stdout.split(b"\x00")
+    if fields and fields[-1] == b"":
+        fields.pop()
+
+    offenders: list[str] = []
+    for index in range(0, len(fields) - 1, 2):
+        scope = fields[index].decode("utf-8", "surrogateescape")
+        if scope not in _UNTRUSTED_CONFIG_SCOPES:
+            continue
+        # A value may contain newlines; the key is everything before the first one.
+        key = fields[index + 1].decode("utf-8", "surrogateescape").split("\n", 1)[0]
+        folded = key.lower()
+        for prefix, suffix in _UNPINNABLE_COMMAND_KEYS:
+            if folded.startswith(prefix) and folded.endswith(suffix) and key not in offenders:
+                offenders.append(key)
+    return offenders
+
+
+def _assert_configuration_is_inert(runner: GitRunner, path: Path) -> None:
+    offenders = _repository_defined_command_config(runner)
+    if offenders:
+        raise UnsafeRepositoryConfigError(
+            "repository-local Git configuration defines commands that Git would execute "
+            "during inspection; Claude Away will not run them. Move the setting to your "
+            "global configuration if you trust it, or remove it",
+            path=str(path),
+            keys=offenders,
+        )
+
+
 def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
     """Detect an interrupted Git operation from marker files.
 
@@ -400,6 +533,23 @@ def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
         if (git_dir / name).exists() and operation not in found:
             found.append(operation)
 
+    # The sequencer outlives CHERRY_PICK_HEAD. `git cherry-pick A B` that conflicts on A and
+    # is then finished with a plain `git commit` rather than `--continue` removes the head
+    # marker but leaves the remaining picks queued in sequencer/todo -- `git status` still
+    # says "Cherry-pick currently in progress", and `--continue` still works. Missing this
+    # is the difference between refusing a half-applied series and branching from the middle
+    # of one. `sequencer/opts` records which verb queued it.
+    if (git_dir / "sequencer" / "todo").exists():
+        queued = RepositoryOperation.CHERRY_PICK
+        try:
+            options = (git_dir / "sequencer" / "opts").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            options = ""
+        if "revert" in options:
+            queued = RepositoryOperation.REVERT
+        if queued not in found:
+            found.append(queued)
+
     # `git am` shares rebase-apply with `git rebase`; the applypatch marker disambiguates.
     if (git_dir / "rebase-apply" / "applying").exists():
         if RepositoryOperation.REBASE in found:
@@ -409,32 +559,56 @@ def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
     return tuple(found)
 
 
-def _resolve_default_branch(runner: GitRunner, configured: str | None) -> str | None:
+def _resolve_default_branch(
+    runner: GitRunner, configured: str | None
+) -> tuple[str | None, str | None]:
     """Determine the repository's default branch without touching the network.
 
+    Returns ``(branch, source)``, where ``source`` is ``"configured"``, ``"origin_head"``
+    or ``None``. The provenance is not decoration: only one of those sources is the
+    *operator* speaking, and the branch this function names is the branch that gets
+    protected. A caller handed a bare string cannot tell a declaration from an assertion
+    the repository made about itself.
+
     Order: the operator's explicit configuration, then ``refs/remotes/origin/HEAD`` if a
-    previous clone recorded one, then ``init.defaultBranch``. Deliberately no fallback to
-    "main" or "master": guessing here would mean guessing which branch is protected, and a
-    wrong guess is a protected-branch mutation. ``None`` is an honest answer and callers
-    treat it as a refusal to proceed.
+    previous clone recorded one. Deliberately no fallback to "main" or "master": guessing
+    here would mean guessing which branch is protected, and a wrong guess is a
+    protected-branch mutation. ``None`` is an honest answer and callers treat it as a
+    refusal to proceed.
+
+    ``init.defaultBranch`` used to be the third source and has been removed. It says what
+    ``git init`` should name a *new* repository's first branch -- it is a personal
+    preference in ``~/.gitconfig``, with no relationship to the default branch of a
+    repository that already exists and may have been cloned, renamed, or created under a
+    different setting. Consulting it produced a confident ``resolved`` answer, indis-
+    tinguishable downstream from a fact, for what was a guess about which branch to protect.
+    It was also repository-overridable, so a line appended to ``.git/config`` moved
+    protection off ``main``.
+
+    ``refs/remotes/origin/HEAD`` is repository-controlled too, and is kept because it is a
+    real record written by a real clone rather than an unrelated preference -- but it is
+    labelled ``origin_head`` precisely so that a caller deciding what to protect can weigh
+    it differently from an operator's declaration.
+
+    Values that are not usable ref names are discarded rather than returned, since anything
+    with write access to the repository can put an option-shaped string there. Returning
+    ``None`` turns that into an ``UNKNOWN_DEFAULT_BRANCH`` refusal against the one
+    repository concerned; returning the value would raise out of whichever caller resolved
+    it next and, in ``awayctl repos``, take every other repository's verdict down with it.
     """
     if configured is not None:
-        return configured
+        return configured, "configured"
 
     completed = runner.run("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
     if completed.returncode == 0:
         reference = completed.stdout.decode("utf-8", "replace").strip()
         prefix = "refs/remotes/origin/"
         if reference.startswith(prefix):
-            return reference[len(prefix) :]
+            candidate = reference[len(prefix) :]
+            if is_safe_ref(candidate):
+                return candidate, "origin_head"
 
-    completed = runner.run("config", "--get", "init.defaultBranch", check=False)
-    if completed.returncode == 0:
-        candidate = completed.stdout.decode("utf-8", "replace").strip()
-        if candidate:
-            return candidate
-
-    return None
+    return None, None
 
 
 def inspect_repository(
@@ -450,20 +624,34 @@ def inspect_repository(
             path=str(path),
             stderr=inside.stderr.decode("utf-8", "replace")[:_MAX_STDERR_CHARS],
         )
-    if inside.stdout.decode().strip() != "true":
-        raise UnsupportedRepositoryError(
-            "path is inside a Git directory but not a working tree", path=str(path)
-        )
-
-    if runner.text("rev-parse", "--is-bare-repository") == "true":
+    # Bare is checked *before* "not a working tree", because a bare repository answers
+    # `false` to both questions and would otherwise get the vaguer of the two messages.
+    # That is what happened until a test stopped matching on `str(exception)` -- which
+    # includes the path, and the fixture's path happened to contain the word "bare".
+    if runner.text("rev-parse", "--is-bare-repository", check=False) == "true":
         raise UnsupportedRepositoryError(
             "bare repositories are not supported: Claude Away needs a working tree to "
             "inspect and, later, to build in",
             path=str(path),
         )
 
+    if inside.stdout.decode().strip() != "true":
+        raise UnsupportedRepositoryError(
+            "path is inside a Git directory but not a working tree", path=str(path)
+        )
+
+    # Before `status`, which is the first command that could fire a repository-defined
+    # filter driver. `rev-parse` above reads no worktree content and triggers nothing.
+    _assert_configuration_is_inert(runner, path)
+
     root = Path(runner.text("rev-parse", "--show-toplevel")).resolve()
     git_dir = Path(runner.text("rev-parse", "--absolute-git-dir"))
+    # `--git-common-dir` may come back relative (".git") depending on the Git version, so
+    # it is anchored to the working tree root rather than to the process cwd.
+    common_dir = Path(runner.text("rev-parse", "--git-common-dir"))
+    if not common_dir.is_absolute():
+        common_dir = (root / common_dir).resolve()
+    common_dir = common_dir.resolve()
 
     head = runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
     head_commit = head.stdout.decode().strip() if head.returncode == 0 else None
@@ -489,15 +677,21 @@ def inspect_repository(
         line for line in runner.text("remote", check=False).splitlines() if line.strip()
     )
 
+    default_branch, default_branch_source = _resolve_default_branch(
+        runner, configured_default_branch
+    )
+
     return RepositoryInspection(
         root=root,
         git_dir=git_dir,
+        common_dir=common_dir,
         head_commit=head_commit,
         branch=branch,
         is_detached=is_detached,
         status=_parse_porcelain_v2(status_output),
         operations_in_progress=_operations_in_progress(git_dir),
-        default_branch=_resolve_default_branch(runner, configured_default_branch),
+        default_branch=default_branch,
+        default_branch_source=default_branch_source,
         remotes=remotes,
     )
 

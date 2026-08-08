@@ -38,7 +38,7 @@ from claude_away.core.policy import Operation, SafetyPolicy
 from claude_away.core.repository import list_tasks, runner_id, task_nodes
 from claude_away.core.state import active_attempt, list_attempts
 from claude_away.core.validation import validate_config_document
-from claude_away.errors import ClaudeAwayError, ValidationError
+from claude_away.errors import ClaudeAwayError, GitError, ValidationError
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -86,9 +86,45 @@ def cmd_version(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _assert_db_outside_a_repository(path: Path) -> None:
+    """Refuse to put the state database inside a Git repository.
+
+    ``enrol_projects`` already refuses a configured ``stateDbPath`` inside an enrolled
+    repository, for a reason it states plainly: the ledger that decides whether work is DONE
+    must not be reachable from inside the thing being judged. But ``awayctl init`` takes its
+    path from ``--db``, ``CLAUDE_AWAY_DB`` or a *working-directory-relative* default, none of
+    which went anywhere near that check -- so running ``awayctl init`` from inside a
+    repository created exactly the arrangement the other guard exists to forbid, and left an
+    untracked ``.claude-away/`` behind that made every later inspection report the repository
+    dirty.
+
+    Checked against any repository, not just enrolled ones: at ``init`` time there is no
+    configuration to consult, and "inside some repository" is the property that matters.
+    """
+    parent = path.expanduser().resolve().parent
+    probe = parent
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+
+    try:
+        inspection = inspect_repository(probe)
+    except GitError:
+        return  # not a repository, which is what we want
+
+    raise ClaudeAwayError(
+        f"refusing to create the state database inside the Git repository at "
+        f"{inspection.root}: the ledger that decides whether work is DONE must live "
+        f"outside the repositories it judges. Pass --db, or set CLAUDE_AWAY_DB, to a "
+        f"location outside any repository",
+        path=str(path),
+        repository_root=str(inspection.root),
+    )
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Create and migrate a state database."""
     path = _resolve_db_path(args)
+    _assert_db_outside_a_repository(path)
     existed = path.exists()
     db = open_database(path, migrate=True)
     try:
@@ -349,21 +385,32 @@ def cmd_repos(args: argparse.Namespace) -> int:
 
     enrolment = enrol_projects(document, config_dir=config_path.parent)
 
-    repositories: list[dict[str, Any]] = []
+    repositories: list[dict[str, Any]] = [
+        {**failure.to_dict(), "root": str(failure.configured_path)}
+        for failure in enrolment.failures
+    ]
     ready = 0
     for repository in enrolment.repositories:
-        inspection = inspect_repository(
-            repository.root, configured_default_branch=repository.default_branch
-        )
-        resolution = resolve_expected_base(inspection, project_id=repository.project_id)
+        entry: dict[str, Any] = dict(repository.to_dict())
+        try:
+            inspection = inspect_repository(
+                repository.root, configured_default_branch=repository.default_branch
+            )
+            resolution = resolve_expected_base(inspection, project_id=repository.project_id)
+        except GitError as exc:
+            # One repository's failure must not take the report down with it. A supervisor
+            # reading `awayctl repos --json` to decide what to work on would otherwise be
+            # blinded to every other repository by a single unreadable one -- and an
+            # unreadable repository is exactly the situation where knowing about the others
+            # matters. The failure is reported in place, against the project it belongs to.
+            entry["error"] = exc.to_dict()
+            repositories.append(entry)
+            continue
+
         ready += 1 if resolution.resolved else 0
-        repositories.append(
-            {
-                **repository.to_dict(),
-                "inspection": inspection.to_dict(),
-                "base": resolution.to_dict(),
-            }
-        )
+        entry["inspection"] = inspection.to_dict()
+        entry["base"] = resolution.to_dict()
+        repositories.append(entry)
 
     payload = {"count": len(repositories), "ready": ready, "repositories": repositories}
     if args.json:
@@ -371,6 +418,10 @@ def cmd_repos(args: argparse.Namespace) -> int:
         return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
 
     for entry in repositories:
+        if "error" in entry:
+            print(f" ERROR   {entry['project_id']}  {entry['root']}")
+            print(f"      {entry['error']['code']}: {entry['error']['message']}")
+            continue
         base = entry["base"]
         mark = "ok " if base["resolved"] else "BLOCKED"
         print(f" {mark} {entry['project_id']}  {entry['root']}")
@@ -384,25 +435,68 @@ def cmd_repos(args: argparse.Namespace) -> int:
     return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
 
 
+def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[list[str], list[str]]:
+    """Every branch that must be treated as protected, plus the projects nothing covers.
+
+    The configured ``defaultBranch`` alone is not enough. It is optional in the schema, and
+    the whole point of :func:`_resolve_default_branch` is to work out the default branch
+    when the configuration is silent -- so a project relying on discovery used to be
+    reported by ``awayctl policy`` as having *no* protected branch while ``awayctl repos``
+    happily resolved a base on it. The safety matrix understating the granted authority is
+    the wrong direction for the one command an operator runs to check exactly that.
+
+    Discovered branches are included, but the union is deliberate rather than a
+    replacement: ``origin/HEAD`` lives inside the repository, so treating discovery as
+    authoritative would let a decoy written there move protection off the real default.
+    Taking both means a repository can only ever *add* to what is protected.
+
+    The second return value names projects whose default branch could not be determined at
+    all. Those are reported rather than silently omitted -- "no protected branch" and "we
+    could not tell" are different answers, and only one of them is safe to act on.
+    """
+    branches: set[str] = set()
+    unknown: list[str] = []
+
+    for project in document.get("projects", []):
+        configured = project.get("defaultBranch")
+        if configured:
+            branches.add(str(configured))
+
+    try:
+        enrolment = enrol_projects(document, config_dir=config_dir)
+    except ClaudeAwayError:
+        # The matrix is still worth printing when the repositories cannot be read -- the
+        # flags are a property of the configuration, not of the filesystem -- so a failure
+        # here degrades to "configured branches only" instead of taking the command down.
+        return sorted(branches), unknown
+
+    for repository in enrolment.repositories:
+        if repository.default_branch:
+            branches.add(repository.default_branch)
+        else:
+            unknown.append(repository.project_id)
+
+    return sorted(branches), sorted(unknown)
+
+
 def cmd_policy(args: argparse.Namespace) -> int:
-    """Print the full allow/deny matrix for a configuration. Pure, no repository access."""
+    """Print the full allow/deny matrix for a configuration.
+
+    Reads repositories only to learn which branches are protected, and degrades to the
+    configured branches if it cannot.
+    """
     config_path = _config_path(args)
     document = json.loads(config_path.read_text(encoding="utf-8"))
     validate_config_document(document)
 
-    protected_branches = sorted(
-        {
-            str(project["defaultBranch"])
-            for project in document.get("projects", [])
-            if project.get("defaultBranch")
-        }
-    )
+    protected_branches, unknown_default = _protected_branches(document, config_path.parent)
     policy = SafetyPolicy.from_config(document, protected_branches=protected_branches)
 
     decisions = [policy.evaluate(operation).to_dict() for operation in Operation]
     payload = {
         "protected_branches": protected_branches,
         "protected_paths": list(policy.protected_paths),
+        "projects_with_unknown_default_branch": unknown_default,
         "decisions": decisions,
     }
     if args.json:
@@ -411,6 +505,8 @@ def cmd_policy(args: argparse.Namespace) -> int:
 
     print(f"protected branches: {', '.join(protected_branches) or '(none)'}")
     print(f"protected paths   : {', '.join(policy.protected_paths) or '(none)'}")
+    if unknown_default:
+        print(f"default branch unknown for: {', '.join(unknown_default)}")
     for decision in decisions:
         verdict = "allow" if decision["allowed"] else "DENY "
         print(f"  {verdict} {decision['operation']:<20} [{decision['rule']}]")

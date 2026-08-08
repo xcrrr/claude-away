@@ -12,9 +12,10 @@ from claude_away.core.policy import (
     Operation,
     PolicyDecision,
     SafetyPolicy,
+    normalise_ref,
     normalise_repo_path,
 )
-from claude_away.errors import PolicyDeniedError
+from claude_away.errors import PolicyDeniedError, ValidationError
 from tests.conftest import config_document
 
 PERMISSIVE = SafetyPolicy(
@@ -243,7 +244,6 @@ class TestPathNormalisation:
         [
             ("src/app.py", "src/app.py"),
             ("./src/app.py", "src/app.py"),
-            ("/src/app.py", "src/app.py"),
             ("src\\app.py", "src/app.py"),
             ("  src/app.py  ", "src/app.py"),
             ("././src/app.py", "src/app.py"),
@@ -256,6 +256,26 @@ class TestPathNormalisation:
         for raw in ["../x", "a/../b", "..", "a/b/../../.."]:
             with pytest.raises(ValueError):
                 normalise_repo_path(raw)
+
+    @pytest.mark.parametrize(
+        "raw", ["/src/app.py", "/home/user/repo/infra/deploy.tf", "\\windows\\path"]
+    )
+    def test_absolute_paths_are_refused_not_reinterpreted(self, raw: str) -> None:
+        """Stripping the leading slash silently produced a wrong answer.
+
+        `/home/user/repo/infra/deploy.tf` became `home/user/repo/infra/deploy.tf`, which
+        shares no component with the entry `infra`, so an obviously protected file
+        evaluated as unprotected. Absolute paths are the natural shape of input from a
+        tool-use hook, which makes it the fail-open that would have mattered.
+        """
+        with pytest.raises(ValueError, match="repository-relative"):
+            normalise_repo_path(raw)
+
+    def test_an_absolute_path_still_fails_closed_at_the_policy(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_paths=("infra",))
+        assert policy.is_path_protected("/home/user/repo/infra/deploy.tf")
+        assert policy.is_path_protected("/anything/at/all")
+        assert not policy.evaluate(Operation.COMMIT, paths=["/home/user/repo/src/app.py"]).allowed
 
 
 class TestEnforcement:
@@ -331,3 +351,118 @@ class TestFromConfig:
         policy = SafetyPolicy.from_config(config_document(), protected_branches=["", None])  # type: ignore[list-item]
         assert policy.protected_branches == ()
         assert not policy.is_branch_protected(None)
+
+
+class TestConfigurationIsTypeCheckedNotCoerced:
+    """`bool("false")` is True. That is the worst possible way to read a safety flag."""
+
+    @pytest.mark.parametrize("value", ["false", "no", "0", 0, 1, "true", []])
+    def test_a_non_boolean_flag_is_refused(self, value: object) -> None:
+        with pytest.raises(ValidationError, match="must be true or false"):
+            SafetyPolicy.from_config({"safety": {"allowPush": value}})
+
+    def test_real_booleans_are_accepted(self) -> None:
+        policy = SafetyPolicy.from_config({"safety": {"allowPush": True, "allowCommit": False}})
+        assert policy.allow_push and not policy.allow_commit
+
+    def test_a_string_protected_paths_is_refused_rather_than_iterated(self) -> None:
+        """`tuple("infra")` is ('i','n','f','r','a'), which protects nothing at all."""
+        with pytest.raises(ValidationError, match="list of strings"):
+            SafetyPolicy.from_config({"safety": {"protectedPaths": "infra"}})
+
+    def test_a_null_safety_block_is_a_domain_error_not_an_attribute_error(self) -> None:
+        policy = SafetyPolicy.from_config({"safety": None})
+        assert not policy.allow_commit
+
+    def test_a_non_object_safety_block_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="must be an object"):
+            SafetyPolicy.from_config({"safety": ["allowPush"]})
+
+
+class TestProtectedPathsThatCannotBeHonoured:
+    """An entry that protects nothing must be a configuration error, not a silent skip."""
+
+    @pytest.mark.parametrize("entry", ["../secrets", "deploy/..", "..", "a/../b"])
+    def test_dot_segment_entries_are_refused(self, entry: str) -> None:
+        with pytest.raises(ValidationError, match="cannot be honoured"):
+            SafetyPolicy.from_config({"safety": {"protectedPaths": [entry]}})
+
+    @pytest.mark.parametrize("entry", ["infra/**", "infra/*", "secrets/*.env", "log[0-9]"])
+    def test_glob_entries_are_refused(self, entry: str) -> None:
+        """Matching is component-wise, so a glob entry equals no real path.
+
+        Refusing is the point: `awayctl policy` printed these verbatim under "protected
+        paths", which is positive confirmation of protection that did not exist.
+        """
+        with pytest.raises(ValidationError, match="glob"):
+            SafetyPolicy.from_config({"safety": {"protectedPaths": [entry]}})
+
+    def test_an_absolute_entry_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="cannot be honoured"):
+            SafetyPolicy.from_config({"safety": {"protectedPaths": ["/etc/passwd"]}})
+
+    def test_ordinary_entries_are_accepted(self) -> None:
+        policy = SafetyPolicy.from_config(
+            {"safety": {"protectedPaths": ["infra", ".github/workflows", "secrets/prod.env"]}}
+        )
+        assert policy.is_path_protected("infra/main.tf")
+
+
+class TestBranchSpellings:
+    """Git yields different spellings depending on which incantation produced the value."""
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "main",
+            "refs/heads/main",
+            "heads/main",
+            "refs/remotes/origin/main",
+            "remotes/origin/main",
+        ],
+    )
+    def test_every_spelling_of_a_protected_branch_is_protected(self, spelling: str) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_branches=("main",))
+        assert policy.is_branch_protected(spelling), spelling
+        assert not policy.evaluate(Operation.COMMIT, branch=spelling).allowed
+
+    def test_a_protected_entry_written_as_a_full_ref_still_matches_the_short_name(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_branches=("refs/heads/main",))
+        assert policy.is_branch_protected("main")
+
+    def test_a_different_branch_is_still_unaffected(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_branches=("main",))
+        assert policy.evaluate(Operation.COMMIT, branch="refs/heads/feature").allowed
+        assert not policy.is_branch_protected("maintenance")
+
+    def test_normalise_ref_is_exported_and_stable(self) -> None:
+        assert normalise_ref("refs/heads/x") == "x"
+        assert normalise_ref("refs/remotes/upstream/x") == "x"
+        assert normalise_ref("x") == "x"
+
+
+class TestTheDefaultIsDenial:
+    def test_every_flag_defaults_to_false(self) -> None:
+        """allow_commit defaulted to True: the one allow-by-default field in the module.
+
+        `SafetyPolicy(protected_paths=..., protected_branches=...)` is the natural call
+        shape for seeding guards, and it used to hand out commit, write, branch and
+        worktree authority nobody had configured.
+        """
+        policy = SafetyPolicy()
+        for operation in Operation:
+            decision = policy.evaluate(operation)
+            if operation in (Operation.INSPECT, Operation.READ_FILE):
+                assert decision.allowed, operation
+            else:
+                assert not decision.allowed, operation
+
+    def test_seeding_only_the_guards_grants_nothing(self) -> None:
+        policy = SafetyPolicy(protected_paths=("infra",), protected_branches=("main",))
+        for operation in (
+            Operation.COMMIT,
+            Operation.WRITE_FILE,
+            Operation.CREATE_BRANCH,
+            Operation.CREATE_WORKTREE,
+        ):
+            assert not policy.evaluate(operation).allowed, operation

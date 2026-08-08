@@ -52,6 +52,7 @@ __all__ = [
     "SelfDependencyError",
     "StaleReplayError",
     "TaskLeasedError",
+    "UnsafeRepositoryConfigError",
     "UnsafeStateLocationError",
     "UnsupportedRepositoryError",
     "ValidationError",
@@ -424,6 +425,19 @@ class NotAGitRepositoryError(GitError):
     """The path exists but is not inside a Git working tree."""
 
     code = "not_a_git_repository"
+
+
+class UnsafeRepositoryConfigError(UnsupportedRepositoryError):
+    """The repository's own configuration names commands Git would execute.
+
+    Distinct from :class:`UnsupportedRepositoryError` because the operator's next action is
+    different: a bare repository is the wrong kind of thing to enrol, whereas this is the
+    right kind of thing carrying a setting that has to be moved or removed. ``details``
+    carries the offending keys under ``keys`` so a supervisor can report them without
+    parsing the message.
+    """
+
+    code = "unsafe_repository_config"
 
 
 class EnrolmentError(ClaudeAwayError):

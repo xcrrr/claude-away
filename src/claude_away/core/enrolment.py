@@ -30,8 +30,10 @@ from typing import Any
 
 from claude_away.adapters.git import RepositoryInspection, inspect_repository, is_safe_ref
 from claude_away.errors import (
+    ClaudeAwayError,
     DuplicateEnrolmentError,
     EnrolmentError,
+    GitError,
     NotEnrolledError,
     UnsafeStateLocationError,
 )
@@ -39,6 +41,7 @@ from claude_away.errors import (
 __all__ = [
     "EnrolledRepository",
     "Enrolment",
+    "EnrolmentFailure",
     "enrol_projects",
     "resolve_config_path",
 ]
@@ -72,12 +75,44 @@ class EnrolledRepository:
     default_branch: str | None
     """From configuration, or discovered locally. ``None`` means genuinely unknown."""
 
+    default_branch_source: str | None
+    """Which of those it was: ``"configured"`` or ``"origin_head"``.
+
+    Kept separate because only the first is the operator speaking. ``origin_head`` is read
+    out of the repository, and the repository is the thing being supervised -- a decoy
+    written there could otherwise move protection off the branch that matters.
+    """
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "configured_path": str(self.configured_path),
             "root": str(self.root),
             "default_branch": self.default_branch,
+            "default_branch_source": self.default_branch_source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EnrolmentFailure:
+    """A configured project whose repository could not be read.
+
+    Recorded rather than raised so that one unreadable repository does not decide the fate
+    of every other one. It is *not* enrolled -- it appears nowhere in
+    :attr:`Enrolment.repositories`, so it grants no authority and nothing can be done in it
+    -- but a supervisor reading the report can see the other repositories and get on with
+    them, and can see why this one is out of action.
+    """
+
+    project_id: str
+    configured_path: Path
+    error: ClaudeAwayError
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "configured_path": str(self.configured_path),
+            "error": self.error.to_dict(),
         }
 
 
@@ -86,6 +121,7 @@ class Enrolment:
     """The complete set of authorised repositories for a configuration."""
 
     repositories: tuple[EnrolledRepository, ...]
+    failures: tuple[EnrolmentFailure, ...] = ()
 
     def by_id(self, project_id: str) -> EnrolledRepository:
         for repository in self.repositories:
@@ -104,16 +140,49 @@ class Enrolment:
         an enrolled repository authorises to that repository; a path anywhere else --
         including a parent directory or a sibling checkout -- is refused. Discovering a
         repository is not the same as being allowed to use it.
+
+        **The most specific repository wins.** Two legitimately enrolled repositories can
+        nest -- a vendored checkout, an ``examples/`` project, a submodule working tree --
+        and returning the first match made the answer depend on the order of ``projects``
+        in the configuration file. Since locks, leases and branch names are keyed by
+        project id, that meant a path could be attributed to the outer project while the
+        inner project believed it held the same tree exclusively: the exact confusion
+        :class:`~claude_away.errors.DuplicateEnrolmentError` exists to prevent, arriving
+        through the back door. Longest matching root is the only answer that does not
+        depend on how the file happens to be written.
+
+        Paths inside the git directory are never authorised. Nothing Claude Away does needs
+        to write there, and ``.git/config`` in particular is *executable configuration*:
+        being able to write it means being able to choose a command that the deterministic
+        controller then runs on its next inspection. Refusing it here closes that loop from
+        the other side, so the guard does not rest on the Git adapter alone.
         """
         candidate = Path(path).expanduser().resolve()
+
+        best: EnrolledRepository | None = None
         for repository in self.repositories:
-            if candidate == repository.root or candidate.is_relative_to(repository.root):
-                return repository
-        raise NotEnrolledError(
-            "path is not inside any enrolled repository",
-            path=str(candidate),
-            enrolled=[str(r.root) for r in self.repositories],
-        )
+            if candidate != repository.root and not candidate.is_relative_to(repository.root):
+                continue
+            if best is None or len(repository.root.parts) > len(best.root.parts):
+                best = repository
+
+        if best is None:
+            raise NotEnrolledError(
+                "path is not inside any enrolled repository",
+                path=str(candidate),
+                enrolled=[str(r.root) for r in self.repositories],
+            )
+
+        relative = candidate.relative_to(best.root)
+        if relative.parts and relative.parts[0] == ".git":
+            raise NotEnrolledError(
+                "paths inside the git directory are never authorised; .git/config names "
+                "commands that Git executes, so writing there is equivalent to choosing "
+                "what the controller runs",
+                path=str(candidate),
+                project_id=best.project_id,
+            )
+        return best
 
     def to_dict(self) -> dict[str, Any]:
         return {"repositories": [r.to_dict() for r in self.repositories]}
@@ -176,6 +245,7 @@ def _enrol_one(
             configured_path=configured,
             root=inspection.root,
             default_branch=inspection.default_branch,
+            default_branch_source=inspection.default_branch_source,
         ),
         inspection,
     )
@@ -205,10 +275,31 @@ def enrol_projects(
 
     projects: Sequence[Mapping[str, Any]] = config.get("projects", ())
     enrolled: list[EnrolledRepository] = []
+    failures: list[EnrolmentFailure] = []
     by_root: dict[Path, str] = {}
+    by_store: dict[Path, str] = {}
+    # Failed projects still count for the state-database check below: not being enrollable
+    # is no reason to let the ledger sit inside them.
+    claimed_paths: list[Path] = []
 
     for project in projects:
-        repository, _inspection = _enrol_one(project, base_dir=config_dir, inspector=inspector)
+        project_id = str(project.get("id", "<unnamed>"))
+        try:
+            repository, inspection = _enrol_one(project, base_dir=config_dir, inspector=inspector)
+        except GitError as exc:
+            # The repository is in a state we cannot read: not a working tree, bare, or
+            # carrying configuration that names commands we refuse to run. That is a fact
+            # about the world rather than a mistake in the configuration, so it disables
+            # this project and leaves the rest of the run intact. Configuration mistakes
+            # (EnrolmentError, DuplicateEnrolmentError) still stop everything, because the
+            # operator has to fix those before any of it means what they think it means.
+            raw = project.get("path")
+            configured = resolve_config_path(str(raw), base_dir=config_dir) if raw else config_dir
+            failures.append(
+                EnrolmentFailure(project_id=project_id, configured_path=configured, error=exc)
+            )
+            claimed_paths.append(configured)
+            continue
 
         existing = by_root.get(repository.root)
         if existing is not None:
@@ -220,16 +311,33 @@ def enrol_projects(
                 repository_root=str(repository.root),
                 project_ids=sorted([existing, repository.project_id]),
             )
+
+        # Distinct roots are not enough. `git worktree add` gives one repository a second
+        # working tree: different root, same refs, same objects, same config. Two project
+        # ids over that share a branch namespace, so a branch created for one task is
+        # visible and movable by the other, and `git checkout` of a branch already checked
+        # out in the sibling fails outright. The shared store is what identifies them.
+        sharing = by_store.get(inspection.common_dir)
+        if sharing is not None:
+            raise DuplicateEnrolmentError(
+                "two projects are linked worktrees of one repository; they share refs and "
+                "objects, so a branch made for one is the same branch for the other",
+                git_common_dir=str(inspection.common_dir),
+                project_ids=sorted([sharing, repository.project_id]),
+            )
+
         by_root[repository.root] = repository.project_id
+        by_store[inspection.common_dir] = repository.project_id
+        claimed_paths.append(repository.root)
         enrolled.append(repository)
 
-    _assert_state_db_outside_repositories(config, config_dir=config_dir, enrolled=enrolled)
+    _assert_state_db_outside_repositories(config, config_dir=config_dir, claimed=claimed_paths)
 
-    return Enrolment(repositories=tuple(enrolled))
+    return Enrolment(repositories=tuple(enrolled), failures=tuple(failures))
 
 
 def _assert_state_db_outside_repositories(
-    config: Mapping[str, Any], *, config_dir: Path, enrolled: Sequence[EnrolledRepository]
+    config: Mapping[str, Any], *, config_dir: Path, claimed: Sequence[Path]
 ) -> None:
     """The state database must not live inside a repository Claude Away works in.
 
@@ -237,18 +345,22 @@ def _assert_state_db_outside_repositories(
     enrolled repository must not be able to reach it -- not because we expect a model to
     attack it, but because "the judge is inside the thing being judged" is the kind of
     arrangement that only has to fail once.
+
+    ``claimed`` covers every path the configuration named, including projects that failed
+    to enrol. A repository being unreadable today is no reason to let the ledger sit inside
+    it: the operator will fix the repository, and then it *is* an enrolled repository with
+    the state database in it.
     """
     raw = config.get("stateDbPath")
     if not raw:
         return
 
     state_path = resolve_config_path(str(raw), base_dir=config_dir)
-    for repository in enrolled:
-        if state_path == repository.root or state_path.is_relative_to(repository.root):
+    for root in claimed:
+        if state_path == root or state_path.is_relative_to(root):
             raise UnsafeStateLocationError(
-                "the state database would live inside an enrolled repository; move it "
-                "outside every enrolled repository",
+                "the state database would live inside a configured repository; move it "
+                "outside every repository named in the configuration",
                 state_db_path=str(state_path),
-                project_id=repository.project_id,
-                repository_root=str(repository.root),
+                repository_root=str(root),
             )

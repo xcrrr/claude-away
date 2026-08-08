@@ -33,13 +33,14 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
 
-from claude_away.errors import PolicyDeniedError
+from claude_away.errors import PolicyDeniedError, ValidationError
 
 __all__ = [
     "Operation",
     "PolicyDecision",
     "PolicyRule",
     "SafetyPolicy",
+    "normalise_ref",
     "normalise_repo_path",
 ]
 
@@ -128,29 +129,107 @@ class PolicyDecision:
             )
 
 
+#: Characters that look like a glob. Protected paths are matched component-wise, not by
+#: globbing, so an entry containing these would silently protect nothing.
+_GLOB_CHARACTERS = ("*", "?", "[")
+
+
 def normalise_repo_path(path: str) -> PurePosixPath:
     """Normalise a repository-relative path for protected-path matching.
 
     Defined once, here, so that two call sites cannot disagree about whether ``./src`` and
     ``src`` are the same thing. Backslashes fold to forward slashes because a Windows-style
-    path must not slip past a guard written with POSIX separators, and ``..`` is rejected
-    outright: a protected-path check is meaningless if the path can escape the repository.
+    path must not slip past a guard written with POSIX separators.
+
+    Two inputs are refused rather than reinterpreted. ``..`` cannot be normalised away: a
+    protected-path check is meaningless if the path can escape the repository. And an
+    **absolute** path is not repository-relative, so there is no honest answer to give --
+    stripping the leading slash used to turn ``/home/me/repo/infra/x`` into
+    ``home/me/repo/infra/x``, which shares no component with the entry ``infra`` and
+    therefore reported an obviously protected file as unprotected. Callers holding an
+    absolute path (a tool-use hook, for one, since Claude Code reports absolute paths) must
+    relativise it against the repository root first; :meth:`SafetyPolicy.is_path_protected`
+    treats anything it cannot normalise as protected, so the failure direction is closed.
     """
     cleaned = path.replace("\\", "/").strip()
+    if cleaned.startswith("/"):
+        raise ValueError(
+            f"path must be repository-relative, not absolute: {path!r}; relativise it "
+            "against the repository root before asking whether it is protected"
+        )
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
-    cleaned = cleaned.lstrip("/")
     candidate = PurePosixPath(cleaned)
     if any(part == ".." for part in candidate.parts):
         raise ValueError(f"repository-relative path must not contain '..': {path!r}")
     return candidate
 
 
+def _validate_protected_paths(entries: Sequence[str]) -> tuple[str, ...]:
+    """Check every configured protected path, refusing the ones that cannot be honoured.
+
+    Previously an entry that failed to normalise was skipped, which is the wrong direction
+    for a guard: ``../secrets`` protected nothing, raised nothing, and ``awayctl policy``
+    still printed it under "protected paths" -- positive confirmation of protection that did
+    not exist. Glob entries did the same thing by a different route, since matching is
+    component-wise and ``infra/**`` is a literal path component that no real path equals.
+
+    An entry we cannot honour is a configuration error, and configuration errors are the
+    operator's to fix before the run starts, not ours to quietly drop.
+    """
+    validated: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValidationError(
+                "safety.protectedPaths entries must be strings", entry=repr(entry)
+            )
+        if any(character in entry for character in _GLOB_CHARACTERS):
+            raise ValidationError(
+                "safety.protectedPaths does not support glob patterns; entries match a path "
+                "and everything under it, so name the directory itself",
+                entry=entry,
+            )
+        try:
+            normalise_repo_path(entry)
+        except ValueError as exc:
+            raise ValidationError(
+                f"safety.protectedPaths entry cannot be honoured: {exc}", entry=entry
+            ) from exc
+        validated.append(entry)
+    return tuple(validated)
+
+
+def normalise_ref(ref: str) -> str:
+    """Reduce a branch to the short name protected-branch entries are written with.
+
+    Git hands back different spellings depending on which incantation produced the value:
+    ``git symbolic-ref HEAD`` gives ``refs/heads/main`` while ``--short`` gives ``main``.
+    Comparing raw strings meant ``refs/heads/main`` was not protected by an entry of
+    ``main`` -- a silent allow that depends on nothing but which command a future caller
+    happened to use. Remote-tracking spellings collapse to the same short name too: that
+    over-protects rather than under-protects, which is the direction to err in.
+    """
+    cleaned = ref.strip()
+    for prefix in ("refs/heads/", "heads/", "refs/remotes/", "remotes/"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+            # A remote-tracking name still carries the remote: origin/main -> main.
+            if prefix in ("refs/remotes/", "remotes/") and "/" in cleaned:
+                cleaned = cleaned.split("/", 1)[1]
+            break
+    return cleaned
+
+
 @dataclass(frozen=True, slots=True)
 class SafetyPolicy:
     """A pure, testable view of ``config.safety``."""
 
-    allow_commit: bool = True
+    # Every flag defaults to False, including this one. It defaulted to True until review
+    # pointed out that the single deny-by-default module had exactly one field that
+    # defaulted to allow -- and that `SafetyPolicy(protected_paths=..., ...)` is the natural
+    # call shape for seeding guards, so the grant would have been handed out by the code
+    # most likely to be written next.
+    allow_commit: bool = False
     allow_push: bool = False
     allow_merge: bool = False
     allow_deploy: bool = False
@@ -163,14 +242,41 @@ class SafetyPolicy:
     def from_config(
         cls, config: Mapping[str, Any], *, protected_branches: Sequence[str] = ()
     ) -> SafetyPolicy:
-        safety: Mapping[str, Any] = config.get("safety", {})
+        """Build a policy from a configuration document.
+
+        Values are type-checked rather than coerced. ``bool("false")`` is ``True``, so a
+        configuration saying ``"allowPush": "false"`` used to enable pushing -- the single
+        worst way to misread a safety flag. Anything that is not a real boolean is a
+        configuration error here, not a silent grant.
+        """
+        raw = config.get("safety") or {}
+        if not isinstance(raw, Mapping):
+            raise ValidationError("safety must be an object", safety=repr(raw))
+
+        def flag(key: str) -> bool:
+            value = raw.get(key, False)
+            if not isinstance(value, bool):
+                raise ValidationError(
+                    f"safety.{key} must be true or false, not a string or number",
+                    key=key,
+                    value=repr(value),
+                )
+            return value
+
+        paths = raw.get("protectedPaths") or ()
+        if isinstance(paths, str) or not isinstance(paths, Sequence):
+            # `tuple("infra")` is ('i','n','f','r','a'), which protects nothing at all.
+            raise ValidationError(
+                "safety.protectedPaths must be a list of strings", protected_paths=repr(paths)
+            )
+
         return cls(
-            allow_commit=bool(safety.get("allowCommit", False)),
-            allow_push=bool(safety.get("allowPush", False)),
-            allow_merge=bool(safety.get("allowMerge", False)),
-            allow_deploy=bool(safety.get("allowDeploy", False)),
-            allow_destructive=bool(safety.get("allowDestructive", False)),
-            protected_paths=tuple(safety.get("protectedPaths", ()) or ()),
+            allow_commit=flag("allowCommit"),
+            allow_push=flag("allowPush"),
+            allow_merge=flag("allowMerge"),
+            allow_deploy=flag("allowDeploy"),
+            allow_destructive=flag("allowDestructive"),
+            protected_paths=_validate_protected_paths(list(paths)),
             protected_branches=tuple(branch for branch in protected_branches if branch),
         )
 
@@ -197,8 +303,11 @@ class SafetyPolicy:
         for entry in self.protected_paths:
             try:
                 protected = normalise_repo_path(entry)
-            except ValueError:
-                continue
+            except ValueError:  # pragma: no cover - _validate_protected_paths rejects these
+                # Reached only if a policy was constructed directly with an entry that
+                # from_config would have refused. Treat it as protected: an entry we cannot
+                # interpret must not be the reason a mutation was allowed.
+                return True
             if candidate == protected or protected in candidate.parents:
                 return True
         return False
@@ -207,7 +316,11 @@ class SafetyPolicy:
         return [path for path in paths if self.is_path_protected(path)]
 
     def is_branch_protected(self, branch: str | None) -> bool:
-        return branch is not None and branch in self.protected_branches
+        """Whether ``branch`` is protected, comparing normalised ref spellings both ways."""
+        if branch is None:
+            return False
+        candidate = normalise_ref(branch)
+        return any(candidate == normalise_ref(entry) for entry in self.protected_branches)
 
     # --------------------------------------------------------------------- evaluation
 

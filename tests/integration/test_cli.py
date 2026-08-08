@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -348,3 +349,132 @@ class TestRepoAndPolicyCommands:
     def test_the_same_path_given_twice_is_accepted(self, tmp_path: Path, command: str) -> None:
         config_path = self._config(tmp_path)
         assert main(["--json", command, str(config_path), "--config", str(config_path)]) == EXIT_OK
+
+
+class TestReposIsolatesPerRepositoryFailures:
+    def test_one_unreadable_repository_does_not_blind_the_report(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A supervisor reads this to decide what to work on.
+
+        A single repository that cannot be inspected used to raise out of the loop and take
+        every other repository's verdict with it -- and an unreadable repository is exactly
+        the situation where knowing about the others matters.
+        """
+        from tests.gitfixtures import make_repo
+
+        healthy = make_repo(tmp_path / "healthy")
+        broken = make_repo(tmp_path / "broken")
+        broken.git("config", "filter.evil.clean", "/bin/true")
+
+        document = config_document()
+        document["projects"] = [
+            {"id": "broken", "path": str(broken.path), "defaultBranch": "main"},
+            {"id": "healthy", "path": str(healthy.path), "defaultBranch": "main"},
+        ]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+
+        by_id = {entry["project_id"]: entry for entry in payload["repositories"]}
+        assert by_id["broken"]["error"]["code"] == "unsafe_repository_config"
+        assert by_id["healthy"]["base"]["resolved"] is True
+        assert payload["count"] == 2
+
+
+class TestPolicyAccountsForDiscoveredBranches:
+    def _config(self, tmp_path: Path, *, declare: bool) -> Path:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+        project: dict[str, Any] = {"id": "api", "path": str(repo.path)}
+        if declare:
+            project["defaultBranch"] = "trunk"
+
+        document = config_document()
+        document["projects"] = [project]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        return config_path
+
+    def test_a_discovered_default_branch_is_protected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`repos` resolved a base on `trunk` while `policy` reported no protected branch."""
+        config_path = self._config(tmp_path, declare=False)
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["protected_branches"] == ["trunk"]
+        assert payload["projects_with_unknown_default_branch"] == []
+
+    def test_a_declared_branch_is_still_protected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = self._config(tmp_path, declare=True)
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        assert json.loads(capsys.readouterr().out)["protected_branches"] == ["trunk"]
+
+    def test_a_project_with_no_determinable_default_is_named(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "No protected branch" and "we could not tell" are different answers."""
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["protected_branches"] == []
+        assert payload["projects_with_unknown_default_branch"] == ["api"]
+
+    def test_the_matrix_still_prints_when_the_repository_is_gone(self, tmp_path: Path) -> None:
+        """The flags are a property of the configuration, not of the filesystem."""
+        import shutil
+
+        config_path = self._config(tmp_path, declare=True)
+        shutil.rmtree(tmp_path / "api")
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+
+
+class TestInitRefusesToLiveInsideARepository:
+    def test_the_default_path_inside_a_repository_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ledger that decides DONE must not sit inside the thing it judges.
+
+        `enrol_projects` refuses a configured stateDbPath inside an enrolled repository,
+        but `awayctl init` took its path from a working-directory-relative default that
+        never went near that check.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        monkeypatch.chdir(repo.path)
+
+        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert "refusing" in json.loads(capsys.readouterr().out)["message"]
+        assert not (repo.path / ".claude-away").exists()
+
+    def test_an_explicit_db_path_inside_a_repository_is_also_refused(self, tmp_path: Path) -> None:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        assert main(["--json", "--db", str(repo.path / "nested" / "state.db"), "init"]) == (
+            EXIT_DOMAIN
+        )
+
+    def test_a_path_outside_every_repository_still_works(self, tmp_path: Path) -> None:
+        assert main(["--json", "--db", str(tmp_path / "state" / "state.db"), "init"]) == EXIT_OK
+        assert (tmp_path / "state" / "state.db").exists()

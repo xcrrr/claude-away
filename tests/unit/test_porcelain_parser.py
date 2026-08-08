@@ -149,6 +149,35 @@ class TestOperationDetection:
         operations = _operations_in_progress(git_dir)
         assert operations == (RepositoryOperation.APPLY_MAILBOX,)
 
+    def test_sequencer_todo_is_an_operation_in_progress(self, tmp_path: Path) -> None:
+        """CHERRY_PICK_HEAD is removed before the sequencer queue is.
+
+        `git cherry-pick A B` that conflicts on A and is finished with a plain `git commit`
+        rather than `--continue` leaves sequencer/todo holding the remaining picks. `git
+        status` still says "Cherry-pick currently in progress" and `--continue` still works,
+        while the marker this used to look for is already gone -- so a repository mid-series
+        reported no operation and resolved a base.
+        """
+        git_dir = tmp_path / "gitdir"
+        (git_dir / "sequencer").mkdir(parents=True)
+        (git_dir / "sequencer" / "todo").write_text("pick abc123\n", encoding="utf-8")
+
+        assert _operations_in_progress(git_dir) == (RepositoryOperation.CHERRY_PICK,)
+
+    def test_sequencer_opts_distinguishes_revert(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / "gitdir"
+        (git_dir / "sequencer").mkdir(parents=True)
+        (git_dir / "sequencer" / "todo").write_text("revert abc123\n", encoding="utf-8")
+        (git_dir / "sequencer" / "opts").write_text('"--revert"\n', encoding="utf-8")
+
+        assert _operations_in_progress(git_dir) == (RepositoryOperation.REVERT,)
+
+    def test_an_empty_sequencer_directory_is_not_an_operation(self, tmp_path: Path) -> None:
+        """`git cherry-pick --quit` leaves the directory; only `todo` means "in progress"."""
+        git_dir = tmp_path / "gitdir"
+        (git_dir / "sequencer").mkdir(parents=True)
+        assert _operations_in_progress(git_dir) == ()
+
     def test_revert_and_bisect(self, tmp_path: Path) -> None:
         git_dir = tmp_path / "gitdir"
         git_dir.mkdir()
@@ -163,7 +192,7 @@ class TestDefaultBranchResolution:
     def test_configuration_wins_without_consulting_git(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
         runner = GitRunner(repo.path)
-        assert _resolve_default_branch(runner, "explicit") == "explicit"
+        assert _resolve_default_branch(runner, "explicit") == ("explicit", "configured")
 
     def test_origin_head_is_used_when_present(self, tmp_path: Path) -> None:
         """Set locally by a clone. Reading it is not a network call."""
@@ -171,15 +200,31 @@ class TestDefaultBranchResolution:
         repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
         repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
 
-        assert _resolve_default_branch(GitRunner(repo.path), None) == "trunk"
+        assert _resolve_default_branch(GitRunner(repo.path), None) == ("trunk", "origin_head")
 
-    def test_init_default_branch_config_is_used(self, tmp_path: Path) -> None:
+    def test_init_default_branch_is_never_consulted(self, tmp_path: Path) -> None:
+        """It names what `git init` calls a *new* branch, not this repository's default.
+
+        It was the third fallback until review pointed out two problems with it: it is a
+        personal preference in ~/.gitconfig with no relationship to an existing repository,
+        and `git config --get` reads the merged config, so a line in the repository's own
+        .git/config could move protection off the real default branch.
+        """
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
         repo.git("config", "init.defaultBranch", "development")
-        assert _resolve_default_branch(GitRunner(repo.path), None) == "development"
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)
 
     def test_nothing_configured_yields_none_not_a_guess(self, tmp_path: Path) -> None:
         """The whole point: never invent "main"."""
         repo = make_repo(tmp_path / "r", initial_branch="trunk")
-        repo.git("config", "--unset-all", "init.defaultBranch", check=False)
-        assert _resolve_default_branch(GitRunner(repo.path), None) is None
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)
+
+    def test_an_option_shaped_discovered_branch_is_discarded(self, tmp_path: Path) -> None:
+        """origin/HEAD is a file anything with repository access can write."""
+        repo = make_repo(tmp_path / "r", initial_branch="trunk")
+        origin = repo.path / ".git" / "refs" / "remotes" / "origin"
+        origin.mkdir(parents=True)
+        (origin / "HEAD").write_text(
+            "ref: refs/remotes/origin/--upload-pack=id\n", encoding="utf-8"
+        )
+        assert _resolve_default_branch(GitRunner(repo.path), None) == (None, None)

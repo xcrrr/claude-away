@@ -109,6 +109,30 @@ class TestRefusals:
         assert BaseRefusal.OPERATION_IN_PROGRESS in resolution.refusals
         assert BaseRefusal.UNMERGED_PATHS in resolution.refusals
 
+    def test_an_interrupted_cherry_pick_series_refuses(self, tmp_path: Path) -> None:
+        """End to end: the sequencer queue must reach a refusal, not just a marker check."""
+        repo = make_repo(tmp_path / "r")
+        repo.write("f.txt", "1\n")
+        repo.commit_all("c0")
+        repo.git("checkout", "-q", "-b", "side")
+        repo.write("f.txt", "A\n")
+        repo.commit_all("cA")
+        repo.write("f.txt", "B\n")
+        repo.commit_all("cB")
+        repo.git("checkout", "-q", "main")
+        repo.write("f.txt", "Z\n")
+        repo.commit_all("cZ")
+        repo.git("cherry-pick", "side~1", "side", check=False)
+        # Finished by hand rather than with --continue: CHERRY_PICK_HEAD goes, the queue stays.
+        repo.write("f.txt", "A\n")
+        repo.git("add", "f.txt")
+        repo.git("commit", "-q", "-m", "resolved by hand")
+
+        assert (repo.path / ".git" / "sequencer" / "todo").exists(), "fixture did not stage it"
+        resolution = resolve(repo.path)
+        assert not resolution.resolved
+        assert BaseRefusal.OPERATION_IN_PROGRESS in resolution.refusals
+
     def test_all_refusals_are_collected_not_short_circuited(self, tmp_path: Path) -> None:
         """An operator fixing one problem should see the rest without another round trip."""
         repo = make_repo(tmp_path / "r")
