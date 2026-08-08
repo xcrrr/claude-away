@@ -18,13 +18,19 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "BaseRevisionError",
     "ClaudeAwayError",
     "DagError",
     "DatabaseError",
     "DependencyCycleError",
     "DuplicateDependencyError",
+    "DuplicateEnrolmentError",
+    "EnrolmentError",
     "EvidenceImmutableError",
     "EvidenceIncompleteError",
+    "GitCommandError",
+    "GitError",
+    "GitOutputError",
     "IdempotencyConflictError",
     "IllegalTransitionError",
     "IntegrityViolationError",
@@ -35,14 +41,19 @@ __all__ = [
     "LeaseNotHeldError",
     "MigrationError",
     "MissingDependencyError",
+    "NotAGitRepositoryError",
+    "NotEnrolledError",
     "NotFoundError",
     "PlanVersionError",
+    "PolicyDeniedError",
     "ReconciliationRequiredError",
     "SchemaValidationError",
     "SchemaVersionError",
     "SelfDependencyError",
     "StaleReplayError",
     "TaskLeasedError",
+    "UnsafeStateLocationError",
+    "UnsupportedRepositoryError",
     "ValidationError",
 ]
 
@@ -355,6 +366,124 @@ class ReconciliationRequiredError(ClaudeAwayError):
     """
 
     code = "reconciliation_required"
+
+
+# --------------------------------------------------------------------------------------
+# Git and enrolment
+# --------------------------------------------------------------------------------------
+
+
+class GitError(ClaudeAwayError):
+    """A Git invocation failed or returned something we refuse to interpret."""
+
+    code = "git_error"
+
+
+class GitCommandError(GitError):
+    """``git`` exited non-zero.
+
+    Carries the argv, exit status and a bounded slice of stderr. Deliberately not the
+    environment: a future supervisor needs to know which command failed, not what was in
+    the process environment when it did.
+    """
+
+    code = "git_command_failed"
+
+    def __init__(
+        self, argv: list[str], returncode: int, stderr: str, cwd: str | None = None
+    ) -> None:
+        super().__init__(
+            f"git {' '.join(argv[1:3])} failed with exit code {returncode}",
+            argv=argv,
+            returncode=returncode,
+            stderr=stderr,
+            cwd=cwd,
+        )
+        self.argv = argv
+        self.returncode = returncode
+
+
+class GitOutputError(GitError):
+    """Git produced output this build will not parse.
+
+    Raised rather than guessed at. A status parser that silently drops an entry it does not
+    understand would report a dirty repository as clean, which is the direction that gets
+    work committed on top of somebody else's changes.
+    """
+
+    code = "git_output_unparseable"
+
+
+class UnsupportedRepositoryError(GitError):
+    """The path is a Git repository of a kind Claude Away does not operate on."""
+
+    code = "unsupported_repository"
+
+
+class NotAGitRepositoryError(GitError):
+    """The path exists but is not inside a Git working tree."""
+
+    code = "not_a_git_repository"
+
+
+class EnrolmentError(ClaudeAwayError):
+    """A configured project could not be turned into a usable enrolled repository."""
+
+    code = "enrolment_error"
+
+
+class NotEnrolledError(EnrolmentError):
+    """An operation named a repository that was never explicitly enrolled.
+
+    The default answer for any path the user did not list. Discovering a repository is not
+    the same as being allowed to touch it.
+    """
+
+    code = "not_enrolled"
+
+
+class DuplicateEnrolmentError(EnrolmentError):
+    """Two project ids resolve to the same canonical repository.
+
+    Refused because locks, leases and branch names are keyed by project id: two ids for one
+    working tree would let two tasks believe they had exclusive access to it.
+    """
+
+    code = "duplicate_enrolment"
+
+
+class UnsafeStateLocationError(EnrolmentError):
+    """The state database would live inside an enrolled repository."""
+
+    code = "unsafe_state_location"
+
+
+class BaseRevisionError(ClaudeAwayError):
+    """The expected base revision could not be established unambiguously."""
+
+    code = "base_revision_unresolved"
+
+
+# --------------------------------------------------------------------------------------
+# Policy
+# --------------------------------------------------------------------------------------
+
+
+class PolicyDeniedError(ClaudeAwayError):
+    """A requested operation was refused by the deterministic safety policy."""
+
+    code = "policy_denied"
+
+    def __init__(self, operation: str, rule: str, reason: str, **details: Any) -> None:
+        super().__init__(
+            f"operation {operation!r} denied by rule {rule!r}: {reason}",
+            operation=operation,
+            rule=rule,
+            reason=reason,
+            **details,
+        )
+        self.operation = operation
+        self.rule = rule
 
 
 # --------------------------------------------------------------------------------------

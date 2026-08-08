@@ -216,4 +216,98 @@ class TestNoUnsafeCommands:
             "status",
             "gate",
             "validate-config",
+            "repos",
+            "policy",
         }
+
+
+class TestRepoAndPolicyCommands:
+    """The Milestone 2A surface. Read-only: neither command may touch a repository."""
+
+    def _config(self, tmp_path: Path, *, dirty: bool = False) -> Path:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        if dirty:
+            repo.write("scratch.txt", "x")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path), "defaultBranch": "main"}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        document["safety"]["protectedPaths"] = ["infra"]
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        return config_path
+
+    def test_repos_reports_a_ready_repository(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = self._config(tmp_path)
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["count"] == 1
+        assert payload["ready"] == 1
+        assert payload["repositories"][0]["base"]["resolved"] is True
+
+    def test_repos_exits_non_zero_when_a_repository_is_not_ready(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A blocked repository is a real signal, so the exit code carries it."""
+        config_path = self._config(tmp_path, dirty=True)
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ready"] == 0
+        assert "dirty_worktree" in payload["repositories"][0]["base"]["refusals"]
+
+    def test_repos_does_not_modify_the_repository(self, tmp_path: Path) -> None:
+        from tests.gitfixtures import GitRepo
+
+        config_path = self._config(tmp_path, dirty=True)
+        repo = GitRepo(tmp_path / "api")
+        before_status = repo.git("status", "--porcelain=v2", "-z").stdout
+        before_head = repo.head()
+
+        main(["--json", "repos", "--config", str(config_path)])
+
+        assert repo.git("status", "--porcelain=v2", "-z").stdout == before_status
+        assert repo.head() == before_head
+
+    def test_repos_refuses_an_unenrolled_state_db_location(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(repo.path / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+
+    def test_policy_prints_the_full_matrix(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from claude_away.core.policy import Operation
+
+        config_path = self._config(tmp_path)
+        assert main(["--json", "policy", "--config", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+
+        assert {d["operation"] for d in payload["decisions"]} == {op.value for op in Operation}
+        assert payload["protected_branches"] == ["main"]
+        by_operation = {d["operation"]: d for d in payload["decisions"]}
+        assert by_operation["force_push"]["allowed"] is False
+        assert by_operation["push"]["allowed"] is False
+        assert by_operation["inspect"]["allowed"] is True
+
+    def test_policy_needs_no_repository_access(self, tmp_path: Path) -> None:
+        """Pure evaluation: it must work even if the repository has since vanished."""
+        import shutil
+
+        config_path = self._config(tmp_path)
+        shutil.rmtree(tmp_path / "api")
+        assert main(["--json", "policy", "--config", str(config_path)]) == EXIT_OK

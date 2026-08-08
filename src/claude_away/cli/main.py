@@ -26,11 +26,15 @@ from pathlib import Path
 from typing import Any
 
 from claude_away import __version__
+from claude_away.adapters.git import inspect_repository
+from claude_away.core.base_revision import resolve_expected_base
 from claude_away.core.dag import blocking_dependencies, find_cycle
 from claude_away.core.db import SCHEMA_VERSION, Database, open_database
+from claude_away.core.enrolment import enrol_projects
 from claude_away.core.evidence import evaluate_gate
 from claude_away.core.leases import active_lease, expired_leases
 from claude_away.core.models import TaskStatus
+from claude_away.core.policy import Operation, SafetyPolicy
 from claude_away.core.repository import list_tasks, runner_id, task_nodes
 from claude_away.core.state import active_attempt, list_attempts
 from claude_away.core.validation import validate_config_document
@@ -309,6 +313,87 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_repos(args: argparse.Namespace) -> int:
+    """Inspect every enrolled repository. Strictly read-only.
+
+    Exercises the whole Milestone 2A boundary end to end: enrolment canonicalises and
+    authorises the paths, Git inspection describes them, and base resolution says whether
+    each one could be branched from. Nothing here writes to a repository.
+    """
+    config_path = Path(args.config)
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    validate_config_document(document)
+
+    enrolment = enrol_projects(document, config_dir=config_path.parent)
+
+    repositories: list[dict[str, Any]] = []
+    ready = 0
+    for repository in enrolment.repositories:
+        inspection = inspect_repository(
+            repository.root, configured_default_branch=repository.default_branch
+        )
+        resolution = resolve_expected_base(inspection, project_id=repository.project_id)
+        ready += 1 if resolution.resolved else 0
+        repositories.append(
+            {
+                **repository.to_dict(),
+                "inspection": inspection.to_dict(),
+                "base": resolution.to_dict(),
+            }
+        )
+
+    payload = {"count": len(repositories), "ready": ready, "repositories": repositories}
+    if args.json:
+        _emit(payload, as_json=True, human="")
+        return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
+
+    for entry in repositories:
+        base = entry["base"]
+        mark = "ok " if base["resolved"] else "BLOCKED"
+        print(f" {mark} {entry['project_id']}  {entry['root']}")
+        inspection_detail = entry["inspection"]
+        branch = inspection_detail["branch"] or "(detached)"
+        print(f"      branch {branch}  head {str(inspection_detail['head_commit'])[:12]}")
+        if base["resolved"]:
+            print(f"      base   {base['commit'][:12]} on {base['branch']}")
+        else:
+            print(f"      refused: {', '.join(base['refusals'])}")
+    return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
+
+
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Print the full allow/deny matrix for a configuration. Pure, no repository access."""
+    config_path = Path(args.config)
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    validate_config_document(document)
+
+    protected_branches = sorted(
+        {
+            str(project["defaultBranch"])
+            for project in document.get("projects", [])
+            if project.get("defaultBranch")
+        }
+    )
+    policy = SafetyPolicy.from_config(document, protected_branches=protected_branches)
+
+    decisions = [policy.evaluate(operation).to_dict() for operation in Operation]
+    payload = {
+        "protected_branches": protected_branches,
+        "protected_paths": list(policy.protected_paths),
+        "decisions": decisions,
+    }
+    if args.json:
+        _emit(payload, as_json=True, human="")
+        return EXIT_OK
+
+    print(f"protected branches: {', '.join(protected_branches) or '(none)'}")
+    print(f"protected paths   : {', '.join(policy.protected_paths) or '(none)'}")
+    for decision in decisions:
+        verdict = "allow" if decision["allowed"] else "DENY "
+        print(f"  {verdict} {decision['operation']:<20} [{decision['rule']}]")
+    return EXIT_OK
+
+
 # ======================================================================================
 # Parser
 # ======================================================================================
@@ -340,6 +425,14 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate-config", help="validate a configuration file")
     validate.add_argument("path")
     validate.set_defaults(func=cmd_validate_config)
+
+    repos = sub.add_parser("repos", help="inspect enrolled repositories (read-only)")
+    repos.add_argument("--config", required=True, help="path to the configuration file")
+    repos.set_defaults(func=cmd_repos)
+
+    policy = sub.add_parser("policy", help="show the allow/deny matrix for a configuration")
+    policy.add_argument("--config", required=True, help="path to the configuration file")
+    policy.set_defaults(func=cmd_policy)
 
     return parser
 
