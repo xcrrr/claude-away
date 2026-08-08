@@ -137,18 +137,54 @@ must be answerable *before* any of that is safe:
 4. **What would be permitted here?** `core/policy.py` answers deterministically, from
    configuration alone, with the rule responsible for each answer.
 
-Two read-only commands expose it: `awayctl repos --config <path>` and
-`awayctl policy --config <path>`.
+Two read-only commands expose it: `awayctl repos <path>` and `awayctl policy <path>` (both
+also accept `--config <path>`).
 
 **Deliberate decisions worth knowing about.**
 
 *Subdirectory enrolment is refused.* Enrolling `repo/src` does not enrol `repo`. Accepting
 it would grant authority over everything beside the directory the user actually named.
 
-*The default branch is never guessed.* Configuration, then `refs/remotes/origin/HEAD`, then
-`init.defaultBranch`, then `None`. There is no fallback to "main" because guessing the
+*A repository's own Git configuration is not trusted.* This is the sharpest edge in M2A and
+it was found by review, not by design. Several Git configuration keys hold *commands Git
+executes*, and `git status` alone is enough to fire them: `core.fsmonitor` runs on every
+invocation, and a `filter.<driver>.clean` runs whenever a tracked file's content has to be
+examined. Since `.git/config` is a file inside the repository -- and from M2B a file Claude
+itself can write -- honouring those keys would mean the deterministic controller executing
+code chosen by the thing it supervises. The forged-cleanliness half is worse than the
+execution half: an `fsmonitor` hook decides what Git believes changed, so a hostile one
+makes a modified worktree report clean and defeats the base-revision guard entirely.
+
+Two defences. Command-bearing keys with fixed names are pinned via `-c` on every invocation,
+which outranks every configuration file. Keys whose middle component is user-chosen cannot
+be pinned, so they are audited and a repository that sets one *in its own config* is
+refused. The operator's global configuration is trusted -- `git lfs install` writes its
+filters there, and refusing every LFS repository would be a bug rather than a safeguard.
+
+*The default branch is never guessed, and it says where it came from.* Configuration, then
+`refs/remotes/origin/HEAD`, then `None`. There is no fallback to "main" because guessing the
 default branch means guessing which branch is protected, and a wrong guess is a
 protected-branch mutation.
+
+`init.defaultBranch` was the third source and has been removed. It names what `git init`
+should call a *new* repository's first branch: a personal preference with no bearing on a
+repository that already exists, and one the repository could override in its own config, so
+a single appended line moved protection off `main`. What remains carries provenance --
+`configured` or `origin_head` -- because only the first is the operator speaking, and the
+branch this resolves is the branch that gets protected.
+
+*Protected branches are the union of declared and discovered.* `awayctl policy` used to read
+only the configured `defaultBranch`, so a project relying on discovery was reported as
+having no protected branch while `awayctl repos` happily resolved a base on it. Taking the
+union means a decoy written into a repository can only ever *add* protection, never move it,
+and projects whose default branch cannot be determined at all are named explicitly -- "none"
+and "we could not tell" are different answers.
+
+*One unreadable repository does not stop the others.* A repository whose state cannot be
+read is recorded as a per-project failure rather than raised: it is not enrolled, so it
+grants no authority, but the rest of the run continues. Configuration mistakes still stop
+everything, because the operator has to fix those before any of it means what they think it
+means.
 
 *Untracked files count as dirty.* They are what a broad `git add` sweeps up, and a task
 that starts on top of them cannot afterwards say which changes were its own.

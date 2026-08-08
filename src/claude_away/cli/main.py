@@ -38,7 +38,12 @@ from claude_away.core.policy import Operation, SafetyPolicy
 from claude_away.core.repository import list_tasks, runner_id, task_nodes
 from claude_away.core.state import active_attempt, list_attempts
 from claude_away.core.validation import validate_config_document
-from claude_away.errors import ClaudeAwayError, GitError, ValidationError
+from claude_away.errors import (
+    ClaudeAwayError,
+    GitError,
+    UnsafeStateLocationError,
+    ValidationError,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -111,7 +116,7 @@ def _assert_db_outside_a_repository(path: Path) -> None:
     except GitError:
         return  # not a repository, which is what we want
 
-    raise ClaudeAwayError(
+    raise UnsafeStateLocationError(
         f"refusing to create the state database inside the Git repository at "
         f"{inspection.root}: the ledger that decides whether work is DONE must live "
         f"outside the repositories it judges. Pass --db, or set CLAUDE_AWAY_DB, to a "

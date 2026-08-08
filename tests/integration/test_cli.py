@@ -464,7 +464,8 @@ class TestInitRefusesToLiveInsideARepository:
         monkeypatch.chdir(repo.path)
 
         assert main(["--json", "init"]) == EXIT_DOMAIN
-        assert "refusing" in json.loads(capsys.readouterr().out)["message"]
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["code"] == "unsafe_state_location"
         assert not (repo.path / ".claude-away").exists()
 
     def test_an_explicit_db_path_inside_a_repository_is_also_refused(self, tmp_path: Path) -> None:
