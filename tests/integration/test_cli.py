@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from claude_away.adapters.git import inspect_repository
 from claude_away.cli.main import EXIT_DOMAIN, EXIT_OK, build_parser, main
 from claude_away.core import repository as repo
 from claude_away.core import state
@@ -449,24 +450,41 @@ class TestPolicyAccountsForDiscoveredBranches:
 
 
 class TestInitRefusesToLiveInsideARepository:
-    def test_the_default_path_inside_a_repository_is_refused(
+    def test_the_default_does_not_follow_the_working_directory(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The ledger that decides DONE must not sit inside the thing it judges.
+        """`awayctl init` inside a repository is the obvious thing to do, and used to be a trap.
 
-        `enrol_projects` refuses a configured stateDbPath inside an enrolled repository,
-        but `awayctl init` took its path from a working-directory-relative default that
-        never went near that check.
+        The default was `./.claude-away/state.db`, so running it from a repository -- what
+        the README's own quickstart does -- put the ledger that decides DONE inside a
+        repository Claude Away works in, and left an untracked directory that made every
+        later inspection report that repository dirty.
         """
         from tests.gitfixtures import make_repo
 
         repo = make_repo(tmp_path / "api")
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
         monkeypatch.chdir(repo.path)
 
-        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert main(["--json", "init"]) == EXIT_OK
         payload = json.loads(capsys.readouterr().out)
-        assert payload["code"] == "unsafe_state_location"
+        assert payload["path"].startswith(str(tmp_path / "state"))
         assert not (repo.path / ".claude-away").exists()
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_a_default_that_would_still_land_in_a_repository_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Belt and braces: the guard does not rest on the default being well chosen."""
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        monkeypatch.setenv("XDG_STATE_HOME", str(repo.path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
+
+        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
 
     def test_an_explicit_db_path_inside_a_repository_is_also_refused(self, tmp_path: Path) -> None:
         from tests.gitfixtures import make_repo

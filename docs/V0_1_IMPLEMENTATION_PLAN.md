@@ -189,6 +189,19 @@ means.
 *Untracked files count as dirty.* They are what a broad `git add` sweeps up, and a task
 that starts on top of them cannot afterwards say which changes were its own.
 
+*So do paths Git has been told not to look at.* `git update-index --assume-unchanged` and
+`--skip-worktree` are ordinary habits for a local config file, and `git status` then reports
+nothing about the path however much its content differs from HEAD — while the difference
+still survives `git checkout -b`. Those paths get their own refusal rather than being folded
+into "dirty", because they may genuinely be unmodified: the problem is that nothing can
+establish it. "We looked and found nothing" and "we were told not to look" are different
+statements, and only the first supports a claim that a tree is clean.
+
+*Minimum Git is 2.26*, set by `git config --list --show-scope`, which the
+repository-configuration audit depends on. An older Git that rejects one of the options this
+adapter relies on now says so, instead of reporting a perfectly good repository as not being
+a repository and sending the operator to check a configuration that was fine.
+
 *Force push has no configuration key at all.* It is denied by a rule, not by a flag being
 false, so no future edit to a config file can enable it.
 

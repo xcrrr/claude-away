@@ -50,7 +50,25 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_DOMAIN = 3
 
-DEFAULT_DB_PATH = Path(".claude-away") / "state.db"
+
+def default_db_path() -> Path:
+    """Where the state database lives when nothing says otherwise.
+
+    Under the XDG state directory, not ``./.claude-away/state.db``. The working-directory
+    relative default meant ``awayctl init`` run from inside a repository -- the obvious
+    place to run it, and what the README's own quickstart does -- created the ledger that
+    decides whether work is DONE *inside a repository Claude Away works in*: the exact
+    arrangement ``enrol_projects`` refuses for a configured ``stateDbPath``. It also left an
+    untracked directory behind, so every later inspection reported that repository dirty and
+    base resolution refused forever.
+
+    A path anchored to the user rather than to the shell's cwd cannot drift into a
+    repository by accident, and one state database per user is the right default for a tool
+    that supervises several repositories at once.
+    """
+    root = os.environ.get("XDG_STATE_HOME")
+    base = Path(root) if root else Path.home() / ".local" / "state"
+    return base / "claude-away" / "state.db"
 
 
 def _emit(payload: Any, *, as_json: bool, human: str) -> None:
@@ -64,7 +82,7 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     if args.db:
         return Path(args.db)
     env = os.environ.get("CLAUDE_AWAY_DB")
-    return Path(env) if env else DEFAULT_DB_PATH
+    return Path(env) if env else default_db_path()
 
 
 def _open(args: argparse.Namespace, *, migrate: bool = False) -> Database:

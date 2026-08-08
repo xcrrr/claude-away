@@ -127,7 +127,7 @@ for the order these arrive in.
 
 ## Try the core
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer and Git 2.26 or newer.
 
 ```bash
 git clone https://github.com/xcrrr/claude-away
