@@ -104,25 +104,78 @@ attempt instead: nothing about the artifact changed, only the clock.
 
 ## Milestone 2 - Git isolation and safety policy
 
-Recommended scope, building directly on Milestone 1:
+**Split into three reviewable slices.** Milestone 1 landed as one very large pull request
+and adversarial review then found twenty-two real defects in it, several critical. The
+volume was the problem: a diff that big cannot be held in one reviewer's head, and the
+issues that got through were exactly the ones that needed a reader who was still paying
+attention. Milestone 2 ships in thirds so each can actually be reviewed.
 
-1. **Project enrolment** against the config schema; refuse any path not enrolled.
-2. **Repository inspection**: dirty worktree detection, expected-base resolution, branch
-   protection assumptions. A dirty or unexpected repository stops the task safely rather
-   than guessing.
-3. **Branch/worktree creation** as `claude-away/<task-id>-<slug>`, recorded on the attempt
-   (already modelled: `base_commit`, `branch`, `worktree_path`).
-4. **Repository locks** so two tasks in one repo cannot interleave. `maxConcurrentTasks`
-   defaults to 1 precisely because this does not exist yet.
-5. **Git reconciliation after a crash** -- the concrete implementation of
-   `reconcile_expired`, which currently records the decision but cannot yet inspect the
-   repository that motivates it. This is the most valuable single item in the milestone.
-6. **Safety policy enforcement** from `config.safety`: no force pushes, no protected-branch
-   merges, no destructive operations, commit/push gated by policy.
+| Slice | Scope | Status |
+| --- | --- | --- |
+| **M2A** | Enrolled-repository boundary, read-only Git inspection, expected-base resolution, deterministic safety policy | **implemented** |
+| **M2B** | Repository locks, isolated branch/worktree lifecycle, attempt Git provenance | planned |
+| **M2C** | Commit/push boundaries, crash reconciliation, fault-injection tests | planned |
 
-Release gate: fault-injection tests that kill the process at each step of branch creation,
-commit and push, and prove that restart never double-commits and never pushes work that
-did not pass its gate.
+Milestone 2 as a whole is **not complete** until M2B and M2C land.
+
+### M2A - the boundary (implemented)
+
+Read-only with respect to user repositories. Nothing in it creates a branch, writes a
+commit, touches the index, or opens a network connection. It answers the questions that
+must be answerable *before* any of that is safe:
+
+1. **Was this repository explicitly enrolled?** `core/enrolment.py` turns configured
+   projects into authorised repositories and fails closed on every ambiguity -- a path
+   resolving to a subdirectory (which would silently widen scope to the parent), two ids
+   resolving to one canonical root, a bare repository, or a state database inside an
+   enrolled repository.
+2. **What is this repository right now?** `adapters/git.py` reports the worktree root, HEAD,
+   branch or detached state, staged/unstaged/untracked/unmerged paths, dirty submodules,
+   and any interrupted Git operation.
+3. **Is the base revision unambiguous?** `core/base_revision.py` returns a verdict rather
+   than a commit, collecting every reason a repository is not safe to branch from.
+4. **What would be permitted here?** `core/policy.py` answers deterministically, from
+   configuration alone, with the rule responsible for each answer.
+
+Two read-only commands expose it: `awayctl repos --config <path>` and
+`awayctl policy --config <path>`.
+
+**Deliberate decisions worth knowing about.**
+
+*Subdirectory enrolment is refused.* Enrolling `repo/src` does not enrol `repo`. Accepting
+it would grant authority over everything beside the directory the user actually named.
+
+*The default branch is never guessed.* Configuration, then `refs/remotes/origin/HEAD`, then
+`init.defaultBranch`, then `None`. There is no fallback to "main" because guessing the
+default branch means guessing which branch is protected, and a wrong guess is a
+protected-branch mutation.
+
+*Untracked files count as dirty.* They are what a broad `git add` sweeps up, and a task
+that starts on top of them cannot afterwards say which changes were its own.
+
+*Force push has no configuration key at all.* It is denied by a rule, not by a flag being
+false, so no future edit to a config file can enable it.
+
+*Protected paths match component-wise.* `infra` covers `infra/main.tf` but not
+`infrastructure.md`. Matching is case-sensitive, like Git's index; on a case-insensitive
+filesystem `INFRA/x` is therefore not caught by `infra`. That is a known limitation rather
+than a fold that would be wrong on Linux, and it is why protected paths are a backstop
+rather than the primary control.
+
+### M2B - locks, branches and worktrees (planned)
+
+Repository locks so two tasks in one repository cannot interleave (`maxConcurrentTasks`
+defaults to 1 precisely because this does not exist). Branch and worktree creation as
+`claude-away/<task-id>-<slug>`, recorded on the attempt -- `base_commit`, `branch` and
+`worktree_path` are already modelled and currently always `None`.
+
+### M2C - commit/push boundaries and reconciliation (planned)
+
+Commit and push gated by the policy M2A established. The concrete implementation of
+`reconcile_expired`, which today records a takeover decision but cannot yet inspect the
+repository that justifies it -- the single most valuable item in Milestone 2. Fault
+injection that kills the process at each step of branch creation, commit and push, proving
+restart never double-commits and never publishes work that did not pass its gate.
 
 ---
 
