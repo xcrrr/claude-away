@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "claude-away",
+  "displayName": "Claude Away",
+  "version": "0.0.1",
+  "description": "Capacity-aware autonomous work planning for Claude Code. Go away; come back to verified progress.",
+  "author": {
+    "name": "xcrrr",
+    "url": "https://github.com/xcrrr"
+  },
+  "homepage": "https://github.com/xcrrr/claude-away",
+  "repository": "https://github.com/xcrrr/claude-away",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "automation",
+    "agents",
+    "workflows",
+    "obsidian",
+    "graphify",
+    "autonomous-coding"
+  ],
+  "defaultEnabled": false
+}

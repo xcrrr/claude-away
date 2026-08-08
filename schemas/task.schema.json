@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xcrrr/claude-away/schemas/task.schema.json",
+  "title": "Claude Away Task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "goalIds",
+    "projectId",
+    "title",
+    "description",
+    "dependencies",
+    "priority",
+    "risk",
+    "acceptanceCriteria",
+    "verification",
+    "humanRequired",
+    "status"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^AWAY-[0-9]{4,}$" },
+    "goalIds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string" }
+    },
+    "projectId": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^AWAY-[0-9]{4,}$" }
+    },
+    "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "risk": { "enum": ["low", "medium", "high"] },
+    "estimatedEffort": { "enum": ["tiny", "small", "medium", "large"] },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "verification": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "required"],
+        "properties": {
+          "type": { "enum": ["command", "artifact", "git", "review", "manual"] },
+          "command": { "type": "string" },
+          "path": { "type": "string" },
+          "description": { "type": "string" },
+          "required": { "type": "boolean" }
+        }
+      }
+    },
+    "humanRequired": { "type": "boolean" },
+    "status": {
+      "enum": ["PENDING", "READY", "RUNNING", "VERIFYING", "DONE", "BLOCKED", "FAILED", "CANCELLED"]
+    },
+    "createdByPlanVersion": { "type": "integer", "minimum": 1 },
+    "updatedByPlanVersion": { "type": "integer", "minimum": 1 }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xcrrr/claude-away/schemas/config.schema.json",
+  "title": "Claude Away Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "mode", "projects", "goals", "capacity", "planning", "safety", "brain"],
+  "properties": {
+    "version": { "const": 1 },
+    "mode": { "enum": ["local", "cloud", "hybrid"] },
+    "projects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+          "path": { "type": "string" },
+          "repository": { "type": "string" },
+          "defaultBranch": { "type": "string" }
+        }
+      }
+    },
+    "goals": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "priority", "successCriteria"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string", "minLength": 1 },
+          "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "successCriteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fiveHourTargetPercent", "weeklyTargetPercent", "noBusywork"],
+      "properties": {
+        "fiveHourTargetPercent": { "type": "number", "minimum": 1, "maximum": 100, "default": 95 },
+        "weeklyTargetPercent": { "type": "number", "minimum": 1, "maximum": 100, "default": 97 },
+        "noBusywork": { "const": true }
+      }
+    },
+    "planning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategicReplanHours", "microReplan", "regenerateWhenEmpty"],
+      "properties": {
+        "strategicReplanHours": { "type": "number", "minimum": 1, "default": 84 },
+        "microReplan": { "type": "boolean", "default": true },
+        "regenerateWhenEmpty": { "type": "boolean", "default": true }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowCommit", "allowPush", "allowMerge", "allowDeploy", "allowDestructive"],
+      "properties": {
+        "allowCommit": { "type": "boolean", "default": true },
+        "allowPush": { "type": "boolean", "default": false },
+        "allowMerge": { "type": "boolean", "default": false },
+        "allowDeploy": { "type": "boolean", "default": false },
+        "allowDestructive": { "type": "boolean", "default": false },
+        "protectedPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+    "brain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "root", "obsidian", "graphify"],
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "root": { "type": "string", "default": ".claude-away/brain" },
+        "obsidian": { "type": "boolean", "default": true },
+        "graphify": { "enum": ["auto", "required", "disabled"], "default": "auto" }
+      }
+    }
+  }
+}
