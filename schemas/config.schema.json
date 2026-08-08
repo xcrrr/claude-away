@@ -2,38 +2,66 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xcrrr/claude-away/schemas/config.schema.json",
   "title": "Claude Away Configuration",
+  "description": "User-declared goals, boundaries and execution limits for an away window. Note what is deliberately NOT here: the runner identity. STATE_MODEL requires a stable runner id, but a config file gets copied between machines, and two runners sharing an owner id would steal each other's leases -- the exact failure leases exist to prevent. The runner id is generated once at init and bound to the state database instead.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "mode", "projects", "goals", "capacity", "planning", "safety", "brain"],
+  "required": [
+    "schemaVersion",
+    "mode",
+    "stateDbPath",
+    "projects",
+    "goals",
+    "capacity",
+    "planning",
+    "execution",
+    "safety",
+    "brain"
+  ],
   "properties": {
-    "version": { "const": 1 },
-    "mode": { "enum": ["local", "cloud", "hybrid"] },
+    "schemaVersion": { "const": 1 },
+    "mode": {
+      "enum": ["local", "cloud"],
+      "description": "The v0.0.1 schema also allowed 'hybrid', which appears in no design document. Undefined product surface that the deterministic core would have to branch on is worse than no surface, so it is removed until something defines it."
+    },
+    "stateDbPath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Location of the authoritative SQLite state database. Relative paths resolve against the config file's directory and never against the process working directory, so a stray 'cd' cannot bring a second state database into existence. Keep it outside every enrolled repository: it must never be something an agent can reach while working."
+    },
     "projects": {
       "type": "array",
       "minItems": 1,
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["id"],
         "properties": {
-          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
-          "path": { "type": "string" },
-          "repository": { "type": "string" },
-          "defaultBranch": { "type": "string" }
+          "id": { "$ref": "#/$defs/identifier" },
+          "path": { "type": "string", "minLength": 1 },
+          "repository": { "type": "string", "minLength": 1 },
+          "defaultBranch": { "type": "string", "minLength": 1 }
         }
-      }
+      },
+      "description": "Only explicitly enrolled repositories are ever touched. Id uniqueness cannot be expressed here -- uniqueItems compares whole objects, so two entries sharing an id but differing elsewhere would pass -- and is enforced by the deterministic validator and a database primary key."
     },
     "goals": {
       "type": "array",
       "minItems": 1,
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["id", "title", "priority", "successCriteria"],
         "properties": {
-          "id": { "type": "string" },
+          "id": { "$ref": "#/$defs/identifier" },
           "title": { "type": "string", "minLength": 1 },
-          "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "priority": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Higher is more important. Same polarity as task priority."
+          },
           "successCriteria": {
             "type": "array",
             "minItems": 1,
@@ -47,9 +75,23 @@
       "additionalProperties": false,
       "required": ["fiveHourTargetPercent", "weeklyTargetPercent", "noBusywork"],
       "properties": {
-        "fiveHourTargetPercent": { "type": "number", "minimum": 1, "maximum": 100, "default": 95 },
-        "weeklyTargetPercent": { "type": "number", "minimum": 1, "maximum": 100, "default": 97 },
-        "noBusywork": { "const": true }
+        "fiveHourTargetPercent": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 95,
+          "description": "Soft target, not a quota to burn. The headroom exists so a task can finish verifying and checkpoint rather than dying at the rate-limit cliff."
+        },
+        "weeklyTargetPercent": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 97
+        },
+        "noBusywork": {
+          "const": true,
+          "description": "Not configurable, and const rather than a boolean on purpose: manufacturing work to consume quota is a property the project refuses to offer as an option."
+        }
       }
     },
     "planning": {
@@ -62,10 +104,57 @@
         "regenerateWhenEmpty": { "type": "boolean", "default": true }
       }
     },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxAttemptsPerTask",
+        "maxConcurrentTasks",
+        "leaseSeconds",
+        "leaseHeartbeatSeconds"
+      ],
+      "description": "Bounds for attempts and leases. The v0.0.1 config had nowhere to configure either, while STATE_MODEL requires a time-bound lease and README promises bounded retries rather than infinite loops.",
+      "properties": {
+        "maxAttemptsPerTask": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 3,
+          "description": "After this many attempts a task becomes FAILED rather than retrying forever."
+        },
+        "maxConcurrentTasks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 1,
+          "description": "Defaults to 1. Parallelism is only safe once repository locking exists (Milestone 2)."
+        },
+        "leaseSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 86400,
+          "default": 1800
+        },
+        "leaseHeartbeatSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 3600,
+          "default": 60,
+          "description": "Must be meaningfully smaller than leaseSeconds; the validator enforces the relationship, which JSON Schema cannot express."
+        }
+      }
+    },
     "safety": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["allowCommit", "allowPush", "allowMerge", "allowDeploy", "allowDestructive"],
+      "required": [
+        "allowCommit",
+        "allowPush",
+        "allowMerge",
+        "allowDeploy",
+        "allowDestructive",
+        "protectedPaths"
+      ],
       "properties": {
         "allowCommit": { "type": "boolean", "default": true },
         "allowPush": { "type": "boolean", "default": false },
@@ -74,8 +163,9 @@
         "allowDestructive": { "type": "boolean", "default": false },
         "protectedPaths": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": []
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "description": "Required (possibly empty) so that no read site needs a fallback for a missing key."
         }
       }
     },
@@ -85,10 +175,52 @@
       "required": ["enabled", "root", "obsidian", "graphify"],
       "properties": {
         "enabled": { "type": "boolean", "default": true },
-        "root": { "type": "string", "default": ".claude-away/brain" },
+        "root": { "type": "string", "minLength": 1, "default": ".claude-away/brain" },
         "obsidian": { "type": "boolean", "default": true },
         "graphify": { "enum": ["auto", "required", "disabled"], "default": "auto" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": false } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "obsidian": { "const": false },
+              "graphify": { "const": "disabled" }
+            },
+            "description": "A disabled brain combined with graphify 'required' is a contradiction. Rejecting it beats silently ignoring the settings the user actually wrote."
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "local" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "projects": { "items": { "required": ["id", "path"] } }
+        },
+        "description": "A local project with no path is as meaningless as a command verification with no command."
       }
+    },
+    {
+      "if": { "properties": { "mode": { "const": "cloud" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "projects": { "items": { "required": ["id", "repository"] } }
+        },
+        "description": "A cloud project must name the repository the routine will attach."
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$"
     }
   }
 }
