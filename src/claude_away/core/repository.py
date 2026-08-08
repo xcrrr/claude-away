@@ -317,11 +317,6 @@ def update_verification_requirements(
                 (task_id,),
             )
         }
-        attempt_row = con.execute(
-            "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
-        ).fetchone()
-        attempt_id = None if attempt_row is None else str(attempt_row["id"])
-
         incoming: dict[str, Mapping[str, Any]] = {str(r["id"]): r for r in requirements}
 
         if not allow_weakening:
@@ -344,11 +339,17 @@ def update_verification_requirements(
                 if not (removed or demoted or respecified):
                     continue
 
+                # Deliberately NOT attempt-scoped. The evidence *gate* must be, because it
+                # asks "is this run finished?". This guard asks a different question --
+                # "was this criterion ever actually met, or is a replan quietly dropping a
+                # check that never passed?" -- and scoping it to the live attempt made a
+                # genuinely-passed requirement look unproven the moment its attempt closed,
+                # blocking legitimate replanning for the wrong reason.
                 latest = con.execute(
                     "SELECT result FROM evidence "
                     " WHERE task_id = ? AND verification_id = ? AND requirement_spec_hash = ? "
-                    "   AND attempt_id IS ? ORDER BY id DESC LIMIT 1",
-                    (task_id, verification_id, str(row["spec_hash"]), attempt_id),
+                    " ORDER BY id DESC LIMIT 1",
+                    (task_id, verification_id, str(row["spec_hash"])),
                 ).fetchone()
                 proven = latest is not None and str(latest["result"]) == "pass"
                 if not proven:

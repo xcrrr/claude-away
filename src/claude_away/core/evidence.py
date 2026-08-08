@@ -51,6 +51,7 @@ from claude_away.core.models import (
 from claude_away.errors import NotFoundError, ValidationError
 
 __all__ = [
+    "COMPATIBLE_EVIDENCE_TYPES",
     "GateReport",
     "evaluate_gate",
     "list_evidence",
@@ -70,6 +71,30 @@ refusal rather than a judgement call. The failures stay in the ledger either way
 "passed on run 3 of 3" remains visible in the return briefing instead of being laundered
 into a clean result.
 """
+
+
+COMPATIBLE_EVIDENCE_TYPES: dict[VerificationType, frozenset[EvidenceType]] = {
+    # Which kinds of evidence can honestly discharge which kind of requirement.
+    #
+    # This is the evidence-side half of STATE_MODEL's rule that "tasks with deterministic
+    # acceptance checks cannot replace those checks with an LLM opinion". Enforcing it only
+    # on the requirement side left the rule trivially defeatable: a required `command`
+    # check could be satisfied by an `EvidenceType.REVIEW` row saying "I read it, the tests
+    # would pass" -- the command never ran, and the gate opened anyway.
+    VerificationType.COMMAND: frozenset(
+        {
+            EvidenceType.COMMAND,
+            EvidenceType.TEST,
+            EvidenceType.LINT,
+            EvidenceType.TYPECHECK,
+            EvidenceType.BUILD,
+        }
+    ),
+    VerificationType.ARTIFACT: frozenset({EvidenceType.ARTIFACT}),
+    VerificationType.GIT: frozenset({EvidenceType.GIT, EvidenceType.PULL_REQUEST}),
+    VerificationType.REVIEW: frozenset({EvidenceType.REVIEW}),
+    VerificationType.MANUAL: frozenset({EvidenceType.MANUAL_APPROVAL}),
+}
 
 
 _OPERATIVE_FIELDS: dict[VerificationType, tuple[str, ...]] = {
@@ -241,7 +266,7 @@ def record_evidence(
 
         if verification_id is not None:
             row = con.execute(
-                "SELECT spec_hash, required FROM verification_requirements "
+                "SELECT spec_hash, required, type FROM verification_requirements "
                 "WHERE task_id = ? AND verification_id = ?",
                 (task_id, verification_id),
             ).fetchone()
@@ -249,6 +274,17 @@ def record_evidence(
                 raise NotFoundError("verification requirement", f"{task_id}/{verification_id}")
             spec_hash = str(row["spec_hash"])
             required_at_run = int(row["required"])
+
+            requirement_type = VerificationType(str(row["type"]))
+            if type not in COMPATIBLE_EVIDENCE_TYPES[requirement_type]:
+                raise ValidationError(
+                    "evidence type cannot discharge this requirement type",
+                    task_id=task_id,
+                    verification_id=verification_id,
+                    requirement_type=requirement_type.value,
+                    evidence_type=type.value,
+                    acceptable=sorted(e.value for e in COMPATIBLE_EVIDENCE_TYPES[requirement_type]),
+                )
 
             # Bound re-runs of the same requirement within one attempt. Counting the
             # current spec_hash only means that legitimately *changing* a check resets the
@@ -270,10 +306,20 @@ def record_evidence(
 
         if attempt_id is not None:
             attempt = con.execute(
-                "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+                "SELECT task_id, outcome FROM attempts WHERE id = ?", (attempt_id,)
             ).fetchone()
             if attempt is None:
                 raise NotFoundError("attempt", attempt_id)
+            if attempt["outcome"] is not None:
+                # A finished attempt is history. Appending to its ledger afterwards would
+                # let a sealed fail be followed by a pass, laundering the record of what
+                # actually happened during that run.
+                raise ValidationError(
+                    "cannot record evidence against a finished attempt",
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    outcome=str(attempt["outcome"]),
+                )
             if str(attempt["task_id"]) != task_id:
                 raise ValidationError(
                     "attempt belongs to a different task",
@@ -438,14 +484,20 @@ def evaluate_gate(
     for requirement in required:
         # Latest-wins within the attempt: a check re-run after a fix supersedes its own
         # earlier failure. Ordering by id is safe because the column is AUTOINCREMENT.
+        # Filtering on type here as well as at record time is deliberate belt-and-braces:
+        # a row written before this rule existed, or by some other path, still cannot
+        # discharge a requirement it was never capable of proving.
+        acceptable = sorted(e.value for e in COMPATIBLE_EVIDENCE_TYPES[requirement.type])
+        placeholders = ",".join("?" * len(acceptable))
         row = db.query_one(
             "SELECT result FROM evidence "
             " WHERE task_id = ? "
             "   AND verification_id = ? "
             "   AND requirement_spec_hash = ? "
             "   AND attempt_id IS ? "
+            f"   AND type IN ({placeholders}) "
             " ORDER BY id DESC LIMIT 1",
-            (task_id, requirement.id, requirement.spec_hash, attempt_id),
+            (task_id, requirement.id, requirement.spec_hash, attempt_id, *acceptable),
         )
 
         if row is None:

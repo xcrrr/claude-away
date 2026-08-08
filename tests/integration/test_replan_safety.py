@@ -192,3 +192,37 @@ class TestWeakeningGuard:
         assert not report.satisfied
         # The rewritten check has no evidence under its new definition.
         assert "typecheck" in report.missing
+
+
+class TestProvenAcrossAttempts:
+    def test_a_requirement_proven_in_a_closed_attempt_stays_proven(self, task: Database) -> None:
+        """The weakening guard asks a different question from the evidence gate.
+
+        The gate is attempt-scoped because it asks "is *this run* finished?". The guard
+        asks "was this criterion ever actually met, or is a replan quietly dropping a check
+        that never passed?" -- so scoping it to the live attempt made a genuinely-passed
+        requirement look unproven the moment its attempt closed, blocking legitimate
+        replanning for entirely the wrong reason.
+        """
+        fail_typecheck(task)  # unit-tests passes, typecheck fails, attempt still open
+        state.request_retry(task, "AWAY-0001", owner_id=OWNER, reason="retry")
+        release_lease(task, "AWAY-0001", OWNER)
+
+        # unit-tests passed in the now-closed attempt, so retiring it is legitimate.
+        repo.update_verification_requirements(
+            task, "AWAY-0001", [TWO_CHECKS[1]], plan_version=next_plan_version(task)
+        )
+        updated = repo.get_task(task, "AWAY-0001")
+        assert updated is not None
+        assert {r.id for r in updated.verification} == {"typecheck"}
+
+    def test_a_requirement_that_never_passed_is_still_refused(self, task: Database) -> None:
+        """The relaxation above must not have opened the door it exists to hold shut."""
+        fail_typecheck(task)  # typecheck FAILED
+        state.request_retry(task, "AWAY-0001", owner_id=OWNER, reason="retry")
+        release_lease(task, "AWAY-0001", OWNER)
+
+        with pytest.raises(ValidationError, match="weaken"):
+            repo.update_verification_requirements(
+                task, "AWAY-0001", [TWO_CHECKS[0]], plan_version=next_plan_version(task)
+            )

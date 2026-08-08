@@ -19,6 +19,7 @@ from typing import Any
 
 __all__ = [
     "ClaudeAwayError",
+    "DagError",
     "DatabaseError",
     "DependencyCycleError",
     "DuplicateDependencyError",
@@ -29,6 +30,7 @@ __all__ = [
     "IntegrityViolationError",
     "InvalidStateError",
     "LeaseConflictError",
+    "LeaseError",
     "LeaseExpiredError",
     "LeaseNotHeldError",
     "MigrationError",
@@ -39,6 +41,7 @@ __all__ = [
     "SchemaValidationError",
     "SchemaVersionError",
     "SelfDependencyError",
+    "StaleReplayError",
     "TaskLeasedError",
     "ValidationError",
 ]

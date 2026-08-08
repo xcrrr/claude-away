@@ -86,6 +86,19 @@ class TestTimestampFormat:
         assert re.match(pattern, rendered), f"{rendered!r} does not match {pattern!r}"
 
 
+def _error_classes() -> list[type[ClaudeAwayError]]:
+    """Every domain error defined in the module, found by introspection."""
+    import inspect
+
+    from claude_away import errors as error_module
+
+    return [
+        obj
+        for _name, obj in inspect.getmembers(error_module, inspect.isclass)
+        if issubclass(obj, ClaudeAwayError) and obj.__module__ == error_module.__name__
+    ]
+
+
 class TestErrors:
     def test_every_error_has_a_stable_code(self) -> None:
         assert NotFoundError("task", "AWAY-0001").code == "not_found"
@@ -109,38 +122,40 @@ class TestErrors:
         assert "AWAY-0001 -> AWAY-0002 -> AWAY-0001" in error.message
 
     def test_all_domain_errors_derive_from_the_base(self) -> None:
-        import inspect
+        for klass in _error_classes():
+            assert issubclass(klass, ClaudeAwayError), klass
 
+    def test_every_error_class_is_exported(self) -> None:
+        """`__all__` must list every error, including the intermediate base classes.
+
+        Discovered by introspecting the module rather than by reading ``__all__``, because
+        a test that iterates ``__all__`` cannot notice something missing from it -- which
+        is exactly how ``StaleReplayError``, ``DagError`` and ``LeaseError`` went
+        unexported. A supervisor catching a category (``except DagError``) needs the base
+        classes as much as the leaves.
+        """
         from claude_away import errors as error_module
 
-        classes: list[type[ClaudeAwayError]] = []
-        for name in error_module.__all__:
-            obj = getattr(error_module, name)
-            if inspect.isclass(obj):
-                assert issubclass(obj, ClaudeAwayError), obj
-                classes.append(obj)
-        assert classes
+        unexported = sorted(
+            klass.__name__
+            for klass in _error_classes()
+            if klass.__name__ not in error_module.__all__
+        )
+        assert not unexported, f"error classes missing from __all__: {unexported}"
 
     def test_error_codes_are_unique(self) -> None:
         """A supervisor branches on these; two errors sharing a code would be ambiguous."""
-        import inspect
-
-        from claude_away import errors as error_module
-
-        owners: dict[str, str] = {}
-        for name in error_module.__all__:
-            obj = getattr(error_module, name)
-            if not inspect.isclass(obj) or obj is ClaudeAwayError:
+        owners: dict[str, type[ClaudeAwayError]] = {}
+        for klass in _error_classes():
+            if klass is ClaudeAwayError:
                 continue
-            assert issubclass(obj, ClaudeAwayError)
-            code = obj.code
+            code = klass.code
             if code in owners:
                 # Sharing a code is fine only by inheritance -- a subclass that does not
-                # redefine it. Two unrelated classes with the same code would make the
-                # supervisor unable to tell them apart.
-                sibling = getattr(error_module, owners[code])
-                assert issubclass(obj, sibling) or issubclass(sibling, obj), (
-                    f"{name} and {owners[code]} both claim code {code!r}"
+                # redefine it. Two unrelated classes with one code would be indistinguishable.
+                sibling = owners[code]
+                assert issubclass(klass, sibling) or issubclass(sibling, klass), (
+                    f"{klass.__name__} and {sibling.__name__} both claim code {code!r}"
                 )
             else:
-                owners[code] = name
+                owners[code] = klass

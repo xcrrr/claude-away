@@ -202,6 +202,37 @@ A second review pass found five more, all fixed here:
 10. **Lease expiry was computed from a clock sampled before `BEGIN IMMEDIATE`** (low). After
     a lock wait, the lease was issued already partly spent.
 
+A third pass found four more, all fixed:
+
+11. **Evidence type was never checked against requirement type** (critical). The rule that
+    an LLM opinion cannot replace a deterministic check was enforced only on the
+    *requirement* side, so an `EvidenceType.REVIEW` row discharged a required `command`
+    requirement and the command never ran. Now a compatibility map, enforced at record time
+    and again in the gate query.
+12. **Evidence could be appended to a finished attempt** (medium), letting a sealed fail be
+    followed by a pass after the fact.
+13. **The idempotency fingerprint omitted `base_commit`, `branch` and `max_attempts`**
+    (medium), so a materially different request replayed instead of raising.
+14. **`awayctl doctor` reported the supported rate-limit suspend path as corruption**
+    (medium). It is now reported as `task_awaiting_resume`, which is what it is.
+
+A fourth pass found four more, all fixed:
+
+15. **`transaction()` partially committed after a swallowed guard abort, and reported the
+    opposite** (high). Once `RAISE(ROLLBACK)` ends SQLite's transaction, every later
+    statement in the block runs in autocommit and lands individually -- while the error
+    said all writes were discarded. A nested block now re-opens a transaction the moment it
+    detects the abort, so the rest of the block stays under control and is discarded with it.
+16. **`migrate()` released the write lock before the migration loop** (medium), leaving the
+    concurrent-first-open race it was meant to close.
+17. **A silent WAL fallback kept `synchronous=NORMAL`** (medium), which SQLite documents as
+    corruption-prone with a rollback journal. Durability now follows the journal mode that
+    was actually granted.
+18. **The weakening guard called a proven requirement unproven once its attempt closed**
+    (medium), blocking legitimate replanning. The gate is attempt-scoped because it asks
+    "is this run finished?"; the guard asks "was this criterion ever met?", which is not the
+    same question.
+
 ## Known limitations, stated plainly
 
 * **A process with write access to the state file can drop the guard triggers.** SQLite
@@ -209,6 +240,11 @@ A second review pass found five more, all fixed here:
   mitigation is architectural: keep the state database outside every enrolled repository,
   mode `0600` (which `awayctl init` sets), and never put its path in an agent's prompt or
   environment.
+* **"Append-only" holds against every in-package path and against ordinary external
+  `UPDATE`/`DELETE`, but not against a deliberate external `INSERT OR REPLACE`.**
+  `PRAGMA recursive_triggers` is per-connection and defaults to OFF; this package sets it,
+  a foreign connection does not. Same architectural mitigation, and worth stating rather
+  than implying a guarantee that does not survive contact with the `sqlite3` CLI.
 * **The gate constrains shape, not judgement.** A bug inside the transition layer could
   still emit a well-formed transition. This is why the guards are pure functions tested
   independently, and why `DONE`/`CANCELLED` absorption is enforced a second time in the

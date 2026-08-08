@@ -26,6 +26,7 @@ from claude_away.core.models import (
 )
 from claude_away.errors import (
     DatabaseError,
+    IdempotencyConflictError,
     InvalidStateError,
     StaleReplayError,
     TaskLeasedError,
@@ -34,6 +35,17 @@ from claude_away.errors import (
 from tests.conftest import load_task, task_document
 
 OWNER = "runner-test"
+
+
+def _to_verifying(db: Database, task_id: str = "AWAY-0001") -> str:
+    """Drive a task to VERIFYING and return its live attempt id."""
+    state.refresh_readiness(db)
+    acquire_lease(db, task_id, OWNER, duration_seconds=99_999)
+    state.start_attempt(db, task_id, owner_id=OWNER)
+    state.begin_verification(db, task_id, owner_id=OWNER)
+    attempt = state.active_attempt(db, task_id)
+    assert attempt is not None
+    return attempt.id
 
 
 def suspended_in_verifying(db: Database) -> None:
@@ -256,21 +268,28 @@ class TestNestedRollbackIsReported:
         state.refresh_readiness(seeded)  # ensure the events table has a row to delete
 
         with (
-            pytest.raises(DatabaseError, match="rolled back by a database guard"),
+            pytest.raises(DatabaseError, match="aborted by a database guard"),
             seeded.transaction() as con,
         ):
             con.execute(
                 "INSERT INTO projects(id, created_at) "
-                "VALUES ('web', '2026-01-01T00:00:00.000000+00:00')"
+                "VALUES ('before', '2026-01-01T00:00:00.000000+00:00')"
             )
             try:
                 with seeded.transaction() as inner:
                     inner.execute("DELETE FROM events")
             except sqlite3.IntegrityError:
                 pass  # a caller that swallows the guard error
+            # Writes issued *after* the abort are the subtle half: SQLite drops to
+            # autocommit once its transaction ends, so without re-opening one this would
+            # land individually while the error claimed everything had been discarded.
+            con.execute(
+                "INSERT INTO projects(id, created_at) "
+                "VALUES ('after', '2026-01-01T00:00:00.000000+00:00')"
+            )
 
-        # And the discarded write really is discarded, rather than half-committed.
-        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'web'") is None
+        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'before'") is None
+        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'after'") is None
 
 
 class TestContractFreezeIsCheckedUnderTheLock:
@@ -295,3 +314,130 @@ class TestContractFreezeIsCheckedUnderTheLock:
             )
         task = load_task(seeded, "AWAY-0001")
         assert {r.id for r in task.verification} == {"unit-tests"}
+
+
+class TestEvidenceTypeMustMatchTheRequirement:
+    """A model's review opinion used to discharge a required deterministic command check.
+
+    STATE_MODEL says "tasks with deterministic acceptance checks cannot replace those
+    checks with an LLM opinion". That was enforced only on the *requirement* side -- a
+    contract could not consist solely of `review` entries -- which left the rule trivially
+    defeatable from the evidence side: an `EvidenceType.REVIEW` row saying "I read it, the
+    tests would pass" satisfied a required `command` requirement, and `pytest` never ran.
+    """
+
+    def test_a_review_cannot_discharge_a_command_check(self, seeded: Database) -> None:
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        attempt_id = _to_verifying(seeded)
+        with pytest.raises(ValidationError, match="cannot discharge"):
+            record_evidence(
+                seeded,
+                task_id="AWAY-0001",
+                attempt_id=attempt_id,
+                verification_id="unit-tests",
+                type=EvidenceType.REVIEW,
+                result=EvidenceResult.PASS,
+                summary="I reviewed it; the tests would pass.",
+            )
+
+    def test_a_manual_approval_cannot_discharge_a_command_check(self, seeded: Database) -> None:
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        attempt_id = _to_verifying(seeded)
+        with pytest.raises(ValidationError, match="cannot discharge"):
+            record_evidence(
+                seeded,
+                task_id="AWAY-0001",
+                attempt_id=attempt_id,
+                verification_id="unit-tests",
+                type=EvidenceType.MANUAL_APPROVAL,
+                result=EvidenceResult.PASS,
+                summary="looks fine to me",
+            )
+
+    @pytest.mark.parametrize(
+        "evidence_type",
+        [
+            EvidenceType.COMMAND,
+            EvidenceType.TEST,
+            EvidenceType.LINT,
+            EvidenceType.TYPECHECK,
+            EvidenceType.BUILD,
+        ],
+    )
+    def test_any_command_shaped_evidence_is_accepted(
+        self, seeded: Database, evidence_type: EvidenceType
+    ) -> None:
+        """The rule must not be so tight that real verifiers cannot report results."""
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        attempt_id = _to_verifying(seeded)
+        record_evidence(
+            seeded,
+            task_id="AWAY-0001",
+            attempt_id=attempt_id,
+            verification_id="unit-tests",
+            type=evidence_type,
+            result=EvidenceResult.PASS,
+            summary="ok",
+        )
+        assert evaluate_gate(seeded, "AWAY-0001", attempt_id=attempt_id).satisfied
+
+    def test_the_gate_also_filters_by_type(self, seeded: Database) -> None:
+        """Defence in depth: a row inserted by some other path still cannot count."""
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        attempt_id = _to_verifying(seeded)
+        seeded.execute(
+            "INSERT INTO evidence(task_id, attempt_id, verification_id,"
+            " requirement_spec_hash, type, result, summary, created_at)"
+            " SELECT ?, ?, 'unit-tests', spec_hash, 'review', 'pass', 'trust me', ?"
+            " FROM verification_requirements"
+            " WHERE task_id = ? AND verification_id = 'unit-tests'",
+            (
+                "AWAY-0001",
+                attempt_id,
+                "2026-01-01T00:00:00.000000+00:00",
+                "AWAY-0001",
+            ),
+        )
+        assert not evaluate_gate(seeded, "AWAY-0001", attempt_id=attempt_id).satisfied
+
+
+class TestFinishedAttemptsCannotBeAppendedTo:
+    def test_evidence_against_a_sealed_attempt_is_refused(self, seeded: Database) -> None:
+        """Otherwise a closed attempt's fail could be followed by a pass, after the fact."""
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        attempt_id = _to_verifying(seeded)
+        record_evidence(
+            seeded,
+            task_id="AWAY-0001",
+            attempt_id=attempt_id,
+            verification_id="unit-tests",
+            type=EvidenceType.TEST,
+            result=EvidenceResult.FAIL,
+            summary="3 failed",
+        )
+        state.request_retry(seeded, "AWAY-0001", owner_id=OWNER, reason="retry")
+
+        with pytest.raises(ValidationError, match="finished attempt"):
+            record_evidence(
+                seeded,
+                task_id="AWAY-0001",
+                attempt_id=attempt_id,
+                verification_id="unit-tests",
+                type=EvidenceType.TEST,
+                result=EvidenceResult.PASS,
+                summary="actually fine",
+            )
+
+
+class TestIdempotencyFingerprintCoversTheRequest:
+    def test_a_different_base_commit_is_not_a_replay(self, seeded: Database) -> None:
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        state.refresh_readiness(seeded)
+        acquire_lease(seeded, "AWAY-0001", OWNER, duration_seconds=99_999)
+        state.start_attempt(
+            seeded, "AWAY-0001", owner_id=OWNER, base_commit="aaa", idempotency_key="k"
+        )
+        with pytest.raises(IdempotencyConflictError):
+            state.start_attempt(
+                seeded, "AWAY-0001", owner_id=OWNER, base_commit="bbb", idempotency_key="k"
+            )
