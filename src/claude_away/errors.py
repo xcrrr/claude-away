@@ -474,13 +474,19 @@ class PolicyDeniedError(ClaudeAwayError):
 
     code = "policy_denied"
 
-    def __init__(self, operation: str, rule: str, reason: str, **details: Any) -> None:
+    def __init__(
+        self, operation: str, rule: str, reason: str, detail: dict[str, Any] | None = None
+    ) -> None:
+        # `detail` is nested rather than splatted. Splatting let a decision whose detail
+        # happened to contain a key named "operation", "rule" or "reason" raise TypeError
+        # instead of the denial -- turning a clean refusal into a crash, and one that an
+        # `except PolicyDeniedError` would not catch.
         super().__init__(
             f"operation {operation!r} denied by rule {rule!r}: {reason}",
             operation=operation,
             rule=rule,
             reason=reason,
-            **details,
+            detail=dict(detail or {}),
         )
         self.operation = operation
         self.rule = rule

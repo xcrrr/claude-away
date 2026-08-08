@@ -344,3 +344,73 @@ class TestModeGuard:
         document["projects"] = [{"id": "api", "repository": "https://example.invalid/api.git"}]
         with pytest.raises(EnrolmentError, match="local-mode"):
             enrol_projects(document, config_dir=tmp_path)
+
+
+class TestConfiguredDefaultBranch:
+    """`defaultBranch` is operator-supplied text that reaches Git as an argument.
+
+    `--upload-pack=...` is a legal branch name as far as the config schema is concerned, so
+    the value is checked against the ref guard at enrolment rather than being carried until
+    something deep in the Git adapter refuses it.
+    """
+
+    @pytest.mark.parametrize(
+        "branch",
+        [
+            "--upload-pack=touch /tmp/claude-away-should-not-exist",
+            "-c",
+            "--exec=id",
+            "main..other",
+            "main^{}",
+            "with space",
+            "with\ttab",
+        ],
+    )
+    def test_option_shaped_default_branch_is_refused(self, tmp_path: Path, branch: str) -> None:
+        repo = make_repo(tmp_path / "api")
+        with pytest.raises(EnrolmentError, match="defaultBranch"):
+            enrol_projects(
+                config_for(
+                    tmp_path, [{"id": "api", "path": str(repo.path), "defaultBranch": branch}]
+                ),
+                config_dir=tmp_path,
+            )
+
+    def test_the_refusal_happens_before_git_is_asked_anything(self, tmp_path: Path) -> None:
+        """The payload must never reach a `git` argv, so nothing it names may appear."""
+        marker = tmp_path / "PWNED"
+        repo = make_repo(tmp_path / "api")
+        with pytest.raises(EnrolmentError):
+            enrol_projects(
+                config_for(
+                    tmp_path,
+                    [
+                        {
+                            "id": "api",
+                            "path": str(repo.path),
+                            "defaultBranch": f"--upload-pack=touch {marker}",
+                        }
+                    ],
+                ),
+                config_dir=tmp_path,
+            )
+        assert not marker.exists()
+
+    def test_an_ordinary_branch_name_is_accepted(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(
+                tmp_path,
+                [{"id": "api", "path": str(repo.path), "defaultBranch": "release/2026-08"}],
+            ),
+            config_dir=tmp_path,
+        )
+        assert enrolment.by_id("api").default_branch == "release/2026-08"
+
+    def test_an_absent_default_branch_is_not_an_error(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "api")
+        enrolment = enrol_projects(
+            config_for(tmp_path, [{"id": "api", "path": str(repo.path)}]),
+            config_dir=tmp_path,
+        )
+        assert enrolment.by_id("api").default_branch in {None, "main"}

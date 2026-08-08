@@ -268,6 +268,36 @@ class TestEnforcement:
     def test_raise_if_denied_is_silent_when_allowed(self) -> None:
         PERMISSIVE.evaluate(Operation.COMMIT).raise_if_denied()
 
+    def test_denial_detail_reaches_the_error(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_paths=("infra",))
+        with pytest.raises(PolicyDeniedError) as caught:
+            policy.evaluate(Operation.COMMIT, paths=["infra/main.tf"]).raise_if_denied()
+        assert caught.value.details["detail"] == {"paths": ["infra/main.tf"]}
+
+    @pytest.mark.parametrize("colliding_key", ["operation", "rule", "reason", "message"])
+    def test_detail_never_collides_with_the_errors_own_fields(self, colliding_key: str) -> None:
+        """`detail` is carried as one nested value, not splatted into the constructor.
+
+        Splatting made the raise itself depend on which keys a rule happened to put in
+        `detail`: a rule adding `detail={"reason": ...}` turned a clean denial into
+        `TypeError: got multiple values for keyword argument 'reason'`, which no
+        `except PolicyDeniedError` handler catches. No shipped rule produces such a key
+        today, so this guards the next rule someone writes rather than a live crash.
+        """
+        decision = PolicyDecision(
+            Operation.PUSH,
+            False,
+            rule="allow_push",
+            reason="denied",
+            detail={colliding_key: "value-from-detail"},
+        )
+        with pytest.raises(PolicyDeniedError) as caught:
+            decision.raise_if_denied()
+
+        assert caught.value.operation == "push"
+        assert caught.value.rule == "allow_push"
+        assert caught.value.details["detail"] == {colliding_key: "value-from-detail"}
+
     def test_policy_evaluation_is_pure(self) -> None:
         """Same inputs, same answer -- no hidden state, no I/O, no model input."""
         first = PERMISSIVE.evaluate(Operation.COMMIT, branch="x", paths=["a"])

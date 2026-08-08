@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from claude_away.adapters.git import RepositoryInspection, inspect_repository
+from claude_away.adapters.git import RepositoryInspection, inspect_repository, is_safe_ref
 from claude_away.errors import (
     DuplicateEnrolmentError,
     EnrolmentError,
@@ -126,6 +126,17 @@ def _enrol_one(
     raw_path = project.get("path")
     if not raw_path:
         raise EnrolmentError("local-mode project has no path", project_id=project_id)
+
+    configured_branch = project.get("defaultBranch")
+    if configured_branch is not None and not is_safe_ref(str(configured_branch)):
+        # Caught here so the operator gets an actionable configuration error rather than a
+        # Git-layer refusal from somewhere much deeper. The ref guard downstream still
+        # holds either way; this is about the message, not the safety.
+        raise EnrolmentError(
+            "configured defaultBranch is not a usable Git ref name",
+            project_id=project_id,
+            default_branch=str(configured_branch),
+        )
 
     configured = Path(str(raw_path)).expanduser()
     resolved = resolve_config_path(str(raw_path), base_dir=base_dir)

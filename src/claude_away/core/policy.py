@@ -124,7 +124,7 @@ class PolicyDecision:
                 operation=self.operation.value,
                 rule=self.rule,
                 reason=self.reason,
-                **self.detail,
+                detail=self.detail,
             )
 
 
