@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -459,10 +458,12 @@ _MIGRATIONS: tuple[tuple[int, str, str], ...] = (
 class Database:
     """A connection to the Claude Away state database.
 
-    Not thread-safe by design: each thread or process opens its own :class:`Database`.
-    That is the model the lease tests exercise, and it is the model a future supervisor
-    will use. A re-entrancy lock guards the transition gate only, because that flag is
-    connection-global.
+    Single-threaded by construction, not merely by convention: ``sqlite3`` defaults to
+    ``check_same_thread=True``, so using one of these from another thread raises
+    ``ProgrammingError``. Each thread or process opens its own :class:`Database`. That is
+    the model the concurrency tests exercise, and it is the model a future supervisor will
+    use -- coordination between them happens through leases in the database, never through
+    shared objects in memory.
     """
 
     def __init__(
@@ -476,7 +477,6 @@ class Database:
         self.clock: Clock = clock or SystemClock()
         self._busy_timeout_ms = busy_timeout_ms
         self._transition_gate_open = False
-        self._gate_lock = threading.RLock()
         self._depth = 0
         self._closed = False
 
@@ -560,14 +560,20 @@ class Database:
 
     @contextmanager
     def _open_transition_gate(self) -> Iterator[None]:
-        """Briefly permit ``tasks.status`` updates on this connection."""
-        with self._gate_lock:
-            previous = self._transition_gate_open
-            self._transition_gate_open = True
-            try:
-                yield
-            finally:
-                self._transition_gate_open = previous
+        """Briefly permit ``tasks.status`` updates on this connection.
+
+        No lock is needed and none would help. ``sqlite3`` defaults to
+        ``check_same_thread=True``, so a :class:`Database` raises ``ProgrammingError`` if
+        touched from any thread but the one that created it -- the gate flag therefore has
+        exactly one possible writer by construction. Nesting is still handled, because a
+        composed operation may open the gate inside an already-open one.
+        """
+        previous = self._transition_gate_open
+        self._transition_gate_open = True
+        try:
+            yield
+        finally:
+            self._transition_gate_open = previous
 
     @contextmanager
     def status_transition(self) -> Iterator[sqlite3.Connection]:

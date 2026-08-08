@@ -190,3 +190,33 @@ class TestRelease:
         with pytest.raises(LeaseNotHeldError):
             release_lease(task, "AWAY-0001", B)
         assert active_lease(task, "AWAY-0001") is not None
+
+
+class TestExpiryBoundary:
+    def test_a_lease_is_dead_exactly_at_its_expiry(
+        self, task: Database, clock: ManualClock
+    ) -> None:
+        """`is_live_at` and `expired_leases` must agree on the boundary instant.
+
+        If one used `<` and the other `<`=`, a lease would be simultaneously live and
+        listed for reconciliation for one tick -- which is exactly when a takeover race
+        would be possible.
+        """
+        acquired = acquire_lease(task, "AWAY-0001", A, duration_seconds=60).lease
+        clock.set(acquired.expires_at)
+
+        assert not acquired.is_live_at(clock.now())
+        assert [lease.task_id for lease in expired_leases(task)] == ["AWAY-0001"]
+        with pytest.raises(ReconciliationRequiredError):
+            acquire_lease(task, "AWAY-0001", B)
+
+    def test_a_lease_is_live_one_microsecond_before_expiry(
+        self, task: Database, clock: ManualClock
+    ) -> None:
+        acquired = acquire_lease(task, "AWAY-0001", A, duration_seconds=60).lease
+        clock.set(acquired.expires_at - timedelta(microseconds=1))
+
+        assert acquired.is_live_at(clock.now())
+        assert expired_leases(task) == []
+        with pytest.raises(LeaseConflictError):
+            acquire_lease(task, "AWAY-0001", B)

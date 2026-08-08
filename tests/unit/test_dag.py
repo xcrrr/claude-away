@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -269,3 +271,34 @@ class TestProperties:
             for i in range(1, count + 1)
         ]
         assert compute_ready(nodes) == (["AWAY-0001"] if count else [])
+
+    @settings(max_examples=400, deadline=None)
+    @given(
+        edges=st.lists(st.tuples(st.integers(1, 7), st.integers(1, 7)), max_size=24, unique=True)
+    )
+    def test_every_reported_cycle_is_a_real_cycle(self, edges: list[tuple[int, int]]) -> None:
+        """The diagnostic must never point at a path that is not actually in the graph.
+
+        The cycle path is reconstructed by walking a parent chain, which is the kind of
+        code that produces a *plausible* answer when it is subtly wrong. This checks the
+        answer against the graph rather than trusting it.
+        """
+        ids = [f"AWAY-{i:04d}" for i in range(1, 8)]
+        dependencies: dict[str, list[str]] = {task_id: [] for task_id in ids}
+        for source, target in edges:
+            dependencies[f"AWAY-{source:04d}"].append(f"AWAY-{target:04d}")
+
+        nodes = {
+            task_id: TaskNode(id=task_id, status=TaskStatus.PENDING, dependencies=tuple(deps))
+            for task_id, deps in dependencies.items()
+        }
+        cycle = find_cycle(nodes)
+        if cycle is None:
+            return
+
+        assert len(cycle) >= 2
+        assert cycle[0] == cycle[-1], "the reported path must be closed"
+        for from_id, to_id in itertools.pairwise(cycle):
+            assert to_id in nodes[from_id].dependencies, (
+                f"{from_id} -> {to_id} is not an edge in the graph; reported {cycle}"
+            )
