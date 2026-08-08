@@ -311,3 +311,40 @@ class TestRepoAndPolicyCommands:
         config_path = self._config(tmp_path)
         shutil.rmtree(tmp_path / "api")
         assert main(["--json", "policy", "--config", str(config_path)]) == EXIT_OK
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_the_config_path_may_be_positional_like_validate_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """`validate-config <path>` works, so `repos <path>` must too.
+
+        Otherwise the second command an operator types after validating their config is a
+        usage error, for no reason other than which spelling each parser happened to get.
+        """
+        config_path = self._config(tmp_path)
+        assert main(["--json", command, str(config_path)]) == EXIT_OK
+        assert json.loads(capsys.readouterr().out)
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_omitting_the_config_path_is_a_domain_error_not_a_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        assert main(["--json", command]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "validation_error"
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_two_conflicting_config_paths_are_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """Silently preferring one would run against a file the operator did not name."""
+        config_path = self._config(tmp_path)
+        other = tmp_path / "other.json"
+        other.write_text("{}", encoding="utf-8")
+
+        assert main(["--json", command, str(config_path), "--config", str(other)]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "validation_error"
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_the_same_path_given_twice_is_accepted(self, tmp_path: Path, command: str) -> None:
+        config_path = self._config(tmp_path)
+        assert main(["--json", command, str(config_path), "--config", str(config_path)]) == EXIT_OK

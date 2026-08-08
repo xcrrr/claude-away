@@ -38,7 +38,7 @@ from claude_away.core.policy import Operation, SafetyPolicy
 from claude_away.core.repository import list_tasks, runner_id, task_nodes
 from claude_away.core.state import active_attempt, list_attempts
 from claude_away.core.validation import validate_config_document
-from claude_away.errors import ClaudeAwayError
+from claude_away.errors import ClaudeAwayError, ValidationError
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -313,6 +313,29 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _add_config_argument(parser: argparse.ArgumentParser) -> None:
+    """Accept the configuration path either positionally or as ``--config``.
+
+    ``validate-config`` takes a bare path, so a command that only accepted ``--config``
+    would make the very next thing an operator types an error. Both spellings work;
+    supplying neither, or both, is refused rather than silently preferring one.
+    """
+    parser.add_argument("path", nargs="?", help="path to the configuration file")
+    parser.add_argument("--config", dest="config", default=None, help=argparse.SUPPRESS)
+
+
+def _config_path(args: argparse.Namespace) -> Path:
+    positional, flag = args.path, args.config
+    if positional and flag and Path(positional) != Path(flag):
+        raise ValidationError(
+            "give the configuration path once, not both positionally and --config"
+        )
+    chosen = positional or flag
+    if not chosen:
+        raise ValidationError("a configuration file path is required")
+    return Path(chosen)
+
+
 def cmd_repos(args: argparse.Namespace) -> int:
     """Inspect every enrolled repository. Strictly read-only.
 
@@ -320,7 +343,7 @@ def cmd_repos(args: argparse.Namespace) -> int:
     authorises the paths, Git inspection describes them, and base resolution says whether
     each one could be branched from. Nothing here writes to a repository.
     """
-    config_path = Path(args.config)
+    config_path = _config_path(args)
     document = json.loads(config_path.read_text(encoding="utf-8"))
     validate_config_document(document)
 
@@ -363,7 +386,7 @@ def cmd_repos(args: argparse.Namespace) -> int:
 
 def cmd_policy(args: argparse.Namespace) -> int:
     """Print the full allow/deny matrix for a configuration. Pure, no repository access."""
-    config_path = Path(args.config)
+    config_path = _config_path(args)
     document = json.loads(config_path.read_text(encoding="utf-8"))
     validate_config_document(document)
 
@@ -426,12 +449,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path")
     validate.set_defaults(func=cmd_validate_config)
 
+    # `path` positional, matching `validate-config`, so the three config-reading commands
+    # take their argument the same way. `--config` stays as an accepted spelling because
+    # it reads better in scripts, but exactly one of the two must be given.
     repos = sub.add_parser("repos", help="inspect enrolled repositories (read-only)")
-    repos.add_argument("--config", required=True, help="path to the configuration file")
+    _add_config_argument(repos)
     repos.set_defaults(func=cmd_repos)
 
     policy = sub.add_parser("policy", help="show the allow/deny matrix for a configuration")
-    policy.add_argument("--config", required=True, help="path to the configuration file")
+    _add_config_argument(policy)
     policy.set_defaults(func=cmd_policy)
 
     return parser
