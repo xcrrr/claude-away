@@ -128,10 +128,12 @@ def acquire_lease(
     if duration_seconds <= 0:
         raise ValueError("lease duration must be positive")
 
-    now = db.clock.now()
-    expires_at = now + timedelta(seconds=duration_seconds)
-
+    # `now` is sampled *inside* the transaction, after BEGIN IMMEDIATE has been granted.
+    # Sampling before could mean waiting on the write lock and then writing an expiry
+    # computed from a stale reading -- a lease that is already partly spent when issued.
     with db.transaction() as con:
+        now = db.clock.now()
+        expires_at = now + timedelta(seconds=duration_seconds)
         if con.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
             raise NotFoundError("task", task_id)
 

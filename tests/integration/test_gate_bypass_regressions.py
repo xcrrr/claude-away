@@ -25,8 +25,10 @@ from claude_away.core.models import (
     TaskStatus,
 )
 from claude_away.errors import (
+    DatabaseError,
     InvalidStateError,
     StaleReplayError,
+    TaskLeasedError,
     ValidationError,
 )
 from tests.conftest import load_task, task_document
@@ -238,3 +240,58 @@ class TestTransitionEntryPointIsPrivate:
         """
         assert not hasattr(seeded, "status_transition")
         assert hasattr(seeded, "_status_transition")
+
+
+class TestNestedRollbackIsReported:
+    """A guard rollback inside a nested block used to surface as a raw sqlite3 error.
+
+    `RAISE(ROLLBACK)` ends the transaction inside SQLite. If a caller swallowed that
+    exception, the outer block's `COMMIT` failed with "cannot commit - no transaction is
+    active" -- an unwrapped error that told nobody the real story, which is that every
+    write in the block had been discarded.
+    """
+
+    def test_swallowed_guard_rollback_raises_a_domain_error(self, seeded: Database) -> None:
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        state.refresh_readiness(seeded)  # ensure the events table has a row to delete
+
+        with (
+            pytest.raises(DatabaseError, match="rolled back by a database guard"),
+            seeded.transaction() as con,
+        ):
+            con.execute(
+                "INSERT INTO projects(id, created_at) "
+                "VALUES ('web', '2026-01-01T00:00:00.000000+00:00')"
+            )
+            try:
+                with seeded.transaction() as inner:
+                    inner.execute("DELETE FROM events")
+            except sqlite3.IntegrityError:
+                pass  # a caller that swallows the guard error
+
+        # And the discarded write really is discarded, rather than half-committed.
+        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'web'") is None
+
+
+class TestContractFreezeIsCheckedUnderTheLock:
+    def test_a_leased_task_still_refuses_a_contract_change(self, seeded: Database) -> None:
+        """The freeze check now runs inside the transaction, not before it.
+
+        Reading the lease first and writing afterwards is a time-of-check/time-of-use gap:
+        a runner could take the lease in between and have its execution contract rewritten
+        underneath it, which is exactly what STATE_MODEL forbids.
+        """
+        repo.create_task(seeded, task_document("AWAY-0001"))
+        acquire_lease(seeded, "AWAY-0001", OWNER, duration_seconds=99_999)
+        with pytest.raises(TaskLeasedError):
+            repo.update_verification_requirements(
+                seeded,
+                "AWAY-0001",
+                [
+                    {"id": "unit-tests", "type": "command", "required": True, "command": "pytest"},
+                    {"id": "extra", "type": "command", "required": True, "command": "mypy"},
+                ],
+                plan_version=1,
+            )
+        task = load_task(seeded, "AWAY-0001")
+        assert {r.id for r in task.verification} == {"unit-tests"}

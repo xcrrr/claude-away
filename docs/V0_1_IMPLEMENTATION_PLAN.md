@@ -185,6 +185,23 @@ now has a regression test in `tests/integration/test_gate_bypass_regressions.py`
 5. **`status_transition()` looked like public API** (low). It opens the database gate and
    validates nothing; every guard lives above it. Renamed to `_status_transition`.
 
+A second review pass found five more, all fixed here:
+
+6. **The leased-task contract freeze was a TOCTOU** (high). The lease was read *before* the
+   transaction opened, so a runner could acquire it in between and have its execution
+   contract rewritten underneath it. Now checked under the write lock.
+7. **A guard rollback inside a nested block surfaced as a raw sqlite3 error** (medium).
+   `RAISE(ROLLBACK)` ends the transaction; if a caller swallowed it, the outer `COMMIT`
+   failed with "cannot commit - no transaction is active" and nothing said that every write
+   in the block had been discarded. Now a typed `DatabaseError` that says exactly that.
+8. **`migrate()` read the schema version outside the write lock** (medium). Two processes
+   opening a fresh database could both read 0 and both attempt migration 1.
+9. **`PRAGMA journal_mode = WAL` could escape as an unwrapped error** (medium). WAL is
+   unavailable on some network filesystems. It buys read availability, not correctness, so
+   the rollback journal is now an acceptable fallback rather than a failure to open.
+10. **Lease expiry was computed from a clock sampled before `BEGIN IMMEDIATE`** (low). After
+    a lock wait, the lease was issued already partly spent.
+
 ## Known limitations, stated plainly
 
 * **A process with write access to the state file can drop the guard triggers.** SQLite

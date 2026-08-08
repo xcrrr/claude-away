@@ -34,12 +34,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 from claude_away.clock import Clock, SystemClock, to_iso
 from claude_away.errors import (
+    DatabaseError,
     IntegrityViolationError,
     MigrationError,
     SchemaVersionError,
@@ -519,7 +520,12 @@ class Database:
         # loss, in exchange for a large write-throughput gain.
         con.execute("PRAGMA synchronous = NORMAL")
         if str(self.path) != ":memory:":
-            con.execute("PRAGMA journal_mode = WAL")
+            # WAL is unavailable on some network filesystems and can fail if another
+            # process holds the database. It buys read availability, not correctness --
+            # every guarantee here rests on BEGIN IMMEDIATE and the constraints -- so
+            # degrading to the rollback journal is far better than refusing to open.
+            with suppress(sqlite3.OperationalError):
+                con.execute("PRAGMA journal_mode = WAL")
 
     def _transition_guard(self) -> int:
         return 1 if self._transition_gate_open else 0
@@ -564,6 +570,16 @@ class Database:
             raise
         else:
             self._depth = 0
+            if not con.in_transaction:
+                # A guard trigger raised RAISE(ROLLBACK) somewhere inside, and the caller
+                # swallowed the exception. SQLite has already discarded everything; a plain
+                # COMMIT here would fail with "cannot commit - no transaction is active"
+                # and hide the fact that writes were lost. Say so explicitly instead.
+                raise DatabaseError(
+                    "transaction was rolled back by a database guard before commit; "
+                    "all writes in this block were discarded",
+                    path=str(self.path),
+                )
             con.execute("COMMIT")
 
     @contextmanager
@@ -639,7 +655,12 @@ class Database:
         version rather than partially upgraded.
         """
         self._ensure_migration_ledger()
-        current = self.schema_version()
+        # Take the write lock before reading the version: two processes opening a fresh
+        # database at once would otherwise both read 0 and both try to apply migration 1.
+        # The ledger's primary key would catch it, but as an opaque constraint error rather
+        # than the clean no-op a second opener should see.
+        with self.transaction():
+            current = self.schema_version()
 
         if current > SCHEMA_VERSION:
             raise SchemaVersionError(

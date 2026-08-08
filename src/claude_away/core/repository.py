@@ -280,17 +280,6 @@ def update_verification_requirements(
     ``allow_weakening`` exists so a human can override deliberately; it demands a
     justification, and the decision is recorded either way.
     """
-    from claude_away.core.leases import active_lease  # local import: avoids a cycle
-
-    now = db.clock.now()
-    lease = active_lease(db, task_id)
-    if lease is not None and lease.is_live_at(now):
-        raise TaskLeasedError(
-            "cannot change the verification contract of a leased task",
-            task_id=task_id,
-            holder=lease.owner_id,
-        )
-
     if allow_weakening and not justification:
         raise ValidationError(
             "overriding the weakening guard requires a justification", task_id=task_id
@@ -303,6 +292,23 @@ def update_verification_requirements(
     validate_verification_contract(requirements, task_id=task_id)
 
     with db.transaction() as con:
+        now = db.clock.now()
+
+        # Checked inside the transaction, not before it. Reading the lease first and
+        # writing afterwards is a time-of-check/time-of-use gap: a runner could acquire
+        # the lease in between and have its execution contract rewritten underneath it,
+        # which is precisely what STATE_MODEL forbids.
+        lease_row = con.execute(
+            "SELECT owner_id, expires_at FROM leases  WHERE task_id = ? AND released_at IS NULL",
+            (task_id,),
+        ).fetchone()
+        if lease_row is not None and parse_timestamp(str(lease_row["expires_at"])) > now:
+            raise TaskLeasedError(
+                "cannot change the verification contract of a leased task",
+                task_id=task_id,
+                holder=str(lease_row["owner_id"]),
+            )
+
         existing = {
             str(row["verification_id"]): row
             for row in con.execute(
