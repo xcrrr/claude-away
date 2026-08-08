@@ -196,6 +196,7 @@ A second review pass found five more, all fixed here:
    in the block had been discarded. Now a typed `DatabaseError` that says exactly that.
 8. **`migrate()` read the schema version outside the write lock** (medium). Two processes
    opening a fresh database could both read 0 and both attempt migration 1.
+   **This fix did not actually land — see the correction below.**
 9. **`PRAGMA journal_mode = WAL` could escape as an unwrapped error** (medium). WAL is
    unavailable on some network filesystems. It buys read availability, not correctness, so
    the rollback journal is now an acceptable fallback rather than a failure to open.
@@ -225,6 +226,7 @@ A fourth pass found four more, all fixed:
     detects the abort, so the rest of the block stays under control and is discarded with it.
 16. **`migrate()` released the write lock before the migration loop** (medium), leaving the
     concurrent-first-open race it was meant to close.
+    **This fix did not actually land either — see the correction below.**
 17. **A silent WAL fallback kept `synchronous=NORMAL`** (medium), which SQLite documents as
     corruption-prone with a rollback journal. Durability now follows the journal mode that
     was actually granted.
@@ -252,3 +254,62 @@ A fourth pass found four more, all fixed:
 * **Nothing here has executed a real task yet.** Every guarantee above is about state
   management. The claim "Claude Away works" is not yet true and this document does not
   make it.
+
+---
+
+## Correction: the `migrate()` race was documented as fixed while still present
+
+Two entries above (8 and 16) claimed the concurrent-first-open race in
+`Database.migrate()` had been closed. **It had not.** The claim survived into a commit
+message, into this document, and through a merge to `main`.
+
+### What actually happened
+
+The fix was applied with a `str.replace()` whose target text did not match the file —
+`ruff format` had joined a two-part string literal onto one line after the pattern was
+written. `str.replace` returns the input unchanged when it matches nothing, so the patch
+silently did nothing. The commit message was written from *intent* rather than from the
+diff, and no test covered the behaviour, so nothing contradicted it. Commit `9242ec3`
+touches `db.py` but its diff contains no change to `migrate()` at all.
+
+Of the four fixes claimed in that commit, three landed and one did not. The other three
+were verified present on `main` by inspection before this correction was written.
+
+### The race, reproduced
+
+Two threads open the same fresh database. The rendezvous fires *after* the first
+transaction of `migrate()` commits, so both openers have read version 0 with no lock held
+before either enters the migration loop:
+
+```
+opener A: ok      schema v1
+opener B: raised  MigrationError: migration 1 (initial deterministic state core)
+                  failed: table meta already exists
+```
+
+No sleeps: the synchronisation is a `threading.Barrier`, and the assertion (every opener
+must converge) does not depend on timing.
+
+### The fix
+
+The version check and the migrations it gates now share one `BEGIN IMMEDIATE`
+transaction. A second opener cannot read the version until the first has committed, so it
+sees the new version and skips. Per-migration ledger rows and per-migration atomicity are
+unchanged, and `_ensure_migration_ledger()` moved inside the error boundary so that a
+`database is locked` during its DDL surfaces as a `MigrationError` rather than a bare
+`sqlite3.OperationalError`.
+
+Regression: `tests/recovery/test_migration_race.py`, verified to **fail** against the
+pre-fix implementation (`git show origin/main:src/claude_away/core/db.py`) and pass after.
+
+### The process lesson
+
+A commit message claiming a bug is fixed is not evidence that the bug is fixed. Three
+habits changed as a result, and they are the reason this entry exists rather than a quiet
+amendment:
+
+1. Every mechanical patch asserts that it changed something; a no-op replace is now an
+   error, not a silent success.
+2. A fix for a behavioural bug ships with a test that was **observed failing** against the
+   old code. "Tests still pass" only proves the fix broke nothing.
+3. Claims in this document are checked against the diff before they are written.
