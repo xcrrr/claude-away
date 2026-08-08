@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "mode": "local",
+  "stateDbPath": "~/.claude-away/state.db",
+
+  "projects": [
+    {
+      "id": "api",
+      "path": "/home/you/code/api",
+      "defaultBranch": "main"
+    },
+    {
+      "id": "web",
+      "path": "/home/you/code/web",
+      "defaultBranch": "main"
+    }
+  ],
+
+  "goals": [
+    {
+      "id": "test-coverage",
+      "title": "Raise API test coverage on the payment module",
+      "priority": 90,
+      "successCriteria": [
+        "Every public function in payments/ has at least one test",
+        "The suite still runs in under two minutes"
+      ]
+    },
+    {
+      "id": "docs-debt",
+      "title": "Document the public HTTP endpoints",
+      "priority": 60,
+      "successCriteria": [
+        "Every route in routes/ has a docstring describing inputs, outputs and errors"
+      ]
+    }
+  ],
+
+  "capacity": {
+    "fiveHourTargetPercent": 95,
+    "weeklyTargetPercent": 97,
+    "noBusywork": true
+  },
+
+  "planning": {
+    "strategicReplanHours": 84,
+    "microReplan": true,
+    "regenerateWhenEmpty": true
+  },
+
+  "execution": {
+    "maxAttemptsPerTask": 3,
+    "maxConcurrentTasks": 1,
+    "leaseSeconds": 1800,
+    "leaseHeartbeatSeconds": 60
+  },
+
+  "safety": {
+    "allowCommit": true,
+    "allowPush": false,
+    "allowMerge": false,
+    "allowDeploy": false,
+    "allowDestructive": false,
+    "protectedPaths": ["infra/", ".github/workflows/"]
+  },
+
+  "brain": {
+    "enabled": true,
+    "root": ".claude-away/brain",
+    "obsidian": true,
+    "graphify": "auto"
+  }
+}

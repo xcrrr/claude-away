@@ -2,9 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xcrrr/claude-away/schemas/task.schema.json",
   "title": "Claude Away Task",
+  "description": "The authoritative record of a single unit of autonomous work, as persisted and emitted by awayctl. A planner does NOT submit this shape -- see #/$defs/taskProposal, which structurally cannot carry a status, a timestamp or a plan version. That split is what makes ARCHITECTURE.md's 'a planner cannot directly mark tasks DONE' an enforced property rather than a promise.",
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schemaVersion",
     "id",
     "goalIds",
     "projectId",
@@ -13,56 +15,218 @@
     "dependencies",
     "priority",
     "risk",
+    "estimatedEffort",
     "acceptanceCriteria",
     "verification",
     "humanRequired",
-    "status"
+    "status",
+    "createdByPlanVersion",
+    "updatedByPlanVersion",
+    "createdAt",
+    "updatedAt",
+    "statusChangedAt"
   ],
   "properties": {
-    "id": { "type": "string", "pattern": "^AWAY-[0-9]{4,}$" },
+    "schemaVersion": { "const": 1 },
+    "id": { "$ref": "#/$defs/taskId" },
     "goalIds": {
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
-      "items": { "type": "string" }
+      "items": { "$ref": "#/$defs/identifier" },
+      "description": "Every task must trace to at least one declared goal. This is the structural reason the planner cannot generate busywork."
     },
-    "projectId": { "type": "string", "minLength": 1 },
-    "title": { "type": "string", "minLength": 1 },
+    "projectId": { "$ref": "#/$defs/identifier" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
     "description": { "type": "string", "minLength": 1 },
     "dependencies": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^AWAY-[0-9]{4,}$" }
+      "items": { "$ref": "#/$defs/taskId" },
+      "description": "Hard dependencies only; v0.1 models no soft-dependency edge. A task cannot become READY until every one of these is DONE. Referential integrity, self-dependency and cycle detection are enforced by the deterministic validator, which JSON Schema cannot express."
     },
-    "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Higher is scheduled first. Stated explicitly because the polarity is otherwise a coin flip, and a scheduler that runs the least valuable work first would be confirmed rather than caught by tests written from the same ambiguity."
+    },
     "risk": { "enum": ["low", "medium", "high"] },
-    "estimatedEffort": { "enum": ["tiny", "small", "medium", "large"] },
+    "estimatedEffort": {
+      "enum": ["tiny", "small", "medium", "large"],
+      "description": "Required. ARCHITECTURE.md's scoring formula puts effort in the denominator, so an absent value would force the scheduler to invent a fact -- exactly what the deterministic core must never do."
+    },
     "acceptanceCriteria": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string", "minLength": 1 }
+      "items": { "$ref": "#/$defs/acceptanceCriterion" },
+      "description": "Human-readable statements of what 'finished' means. Each carries a stable id so that a replan silently weakening or dropping a criterion is detectable, which PRODUCT_SPEC.md explicitly forbids."
     },
     "verification": {
       "type": "array",
       "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["type", "required"],
-        "properties": {
-          "type": { "enum": ["command", "artifact", "git", "review", "manual"] },
-          "command": { "type": "string" },
-          "path": { "type": "string" },
-          "description": { "type": "string" },
-          "required": { "type": "boolean" }
-        }
-      }
+      "items": { "$ref": "#/$defs/verificationRequirement" },
+      "description": "The machine-checkable acceptance contract. At least one entry is mandatory, and the deterministic validator additionally requires at least one REQUIRED entry that is not of type 'review' -- an LLM opinion may supplement a deterministic check but never replace it."
+    },
+    "expectedArtifacts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Repository-relative paths the task is expected to produce or modify. Declared by the planner; consumed by artifact verification in a later milestone."
     },
     "humanRequired": { "type": "boolean" },
     "status": {
-      "enum": ["PENDING", "READY", "RUNNING", "VERIFYING", "DONE", "BLOCKED", "FAILED", "CANCELLED"]
+      "enum": [
+        "PENDING",
+        "READY",
+        "RUNNING",
+        "VERIFYING",
+        "DONE",
+        "BLOCKED",
+        "FAILED",
+        "CANCELLED"
+      ],
+      "description": "Controller-owned. Absent from #/$defs/taskProposal by construction."
     },
-    "createdByPlanVersion": { "type": "integer", "minimum": 1 },
-    "updatedByPlanVersion": { "type": "integer", "minimum": 1 }
+    "createdByPlanVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Immutable after first write. Without it a replan diff cannot be reconstructed after a crash."
+    },
+    "updatedByPlanVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Equals createdByPlanVersion on creation. The relation updatedByPlanVersion >= createdByPlanVersion is not expressible in JSON Schema and is enforced by the validator and by a database CHECK constraint."
+    },
+    "createdAt": { "$ref": "#/$defs/timestamp" },
+    "updatedAt": { "$ref": "#/$defs/timestamp" },
+    "statusChangedAt": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "taskId": {
+      "type": "string",
+      "pattern": "^AWAY-(?:[0-9]{4}|[1-9][0-9]{4,7})$",
+      "description": "Zero-padded to exactly four digits through AWAY-9999, unpadded beyond. The stricter form matters because the looser '^AWAY-[0-9]{4,}$' admitted both AWAY-0001 and AWAY-00001 as distinct spellings of one logical id, which is an identity hazard for ids the state model promises never to recycle."
+    },
+    "identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$",
+      "description": "Lowercase only: case-insensitive filesystems collide, and SQLite string equality does not fold case."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{6}\\+00:00$",
+      "description": "UTC, always exactly six fractional digits, always a +00:00 offset: fixed width. SQLite has no datetime type, so timestamps are TEXT and every index orders them lexicographically. Fixing the width is what makes byte order equal chronological order. Note that 'format' is annotation-only in Draft 2020-12 unless the format-assertion vocabulary is enabled, so the pattern is the real enforcement."
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "text": { "type": "string", "minLength": 1 }
+      }
+    },
+    "verificationRequirement": {
+      "type": "object",
+      "required": ["id", "type", "required"],
+      "description": "One declared acceptance check. The 'id' is stable within the task and is what an evidence record points at. Array position is deliberately NOT identity: a replan may reorder or insert entries, and position-based identity would silently re-point evidence at a different check.",
+      "$comment": "Cross-type field leakage is prevented by unevaluatedProperties:false combined with declaring each type-specific property ONLY inside its matching 'then' branch. Without that, {\"type\":\"artifact\",\"path\":\"dist/app\",\"command\":\"true\"} would validate, and a verifier that dispatches on the presence of 'command' would run 'true' and record a pass.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier",
+          "description": "Stable within the task, e.g. 'unit-tests'. Uniqueness across the array is enforced by the deterministic validator and by a database primary key; JSON Schema's uniqueItems compares whole objects and so cannot express it."
+        },
+        "type": { "enum": ["command", "artifact", "git", "review", "manual"] },
+        "required": {
+          "type": "boolean",
+          "description": "When true, DONE is impossible without passing evidence for this requirement from the current attempt."
+        },
+        "description": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "command" } }, "required": ["type"] },
+          "then": {
+            "required": ["command"],
+            "properties": { "command": { "type": "string", "minLength": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "artifact" } }, "required": ["type"] },
+          "then": {
+            "required": ["path"],
+            "properties": { "path": { "type": "string", "minLength": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "git" } }, "required": ["type"] },
+          "then": { "required": ["description"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "review" } }, "required": ["type"] },
+          "then": { "required": ["description"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "manual" } }, "required": ["type"] },
+          "then": { "required": ["description"] }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "taskProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "goalIds",
+        "projectId",
+        "title",
+        "description",
+        "dependencies",
+        "priority",
+        "risk",
+        "estimatedEffort",
+        "acceptanceCriteria",
+        "verification",
+        "humanRequired"
+      ],
+      "description": "The ONLY shape a planner may submit. Note what is absent and unrepresentable: status, all three timestamps, both plan versions and schemaVersion. A proposal carrying \"status\": \"DONE\" is rejected by additionalProperties, so the controller -- not the model -- decides what is done. Presence of 'id' means 'modify this existing task'; absence means 'create', and the controller assigns the next identifier.",
+      "properties": {
+        "id": { "$ref": "#/$defs/taskId" },
+        "goalIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "projectId": { "$ref": "#/$defs/identifier" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description": { "type": "string", "minLength": 1 },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/taskId" }
+        },
+        "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "estimatedEffort": { "enum": ["tiny", "small", "medium", "large"] },
+        "acceptanceCriteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/acceptanceCriterion" }
+        },
+        "verification": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/verificationRequirement" }
+        },
+        "expectedArtifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "humanRequired": { "type": "boolean" }
+      }
+    }
   }
 }

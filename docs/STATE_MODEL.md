@@ -32,8 +32,14 @@ The state machine is the backbone of Claude Away. Every transition is explicit, 
 | `VERIFYING` | `RUNNING` | verification failed and bounded retry remains |
 | `VERIFYING` | `BLOCKED` | failure needs human/external resolution |
 | `VERIFYING` | `FAILED` | verification retry policy exhausted |
-| `BLOCKED` | `READY` | blocker explicitly resolved; readiness recalculated |
+| `BLOCKED` | `READY` | blocker explicitly resolved; readiness recalculated and satisfied |
+| `BLOCKED` | `PENDING` | blocker resolved, but recalculated readiness is no longer satisfied |
 | any non-`DONE` | `CANCELLED` | explicit user action or recorded planner retirement |
+
+`BLOCKED` has two exits because resolving a blocker recomputes readiness rather than
+assuming it. A dependency may have been cancelled while the task sat blocked, and
+promoting straight to `READY` would start a task whose prerequisites can never be
+satisfied.
 
 No transition out of `DONE` occurs silently. If later work invalidates a completed result, create a follow-up task linked to the original evidence.
 
