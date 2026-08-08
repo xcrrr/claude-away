@@ -357,10 +357,42 @@ def _assert_state_db_outside_repositories(
 
     state_path = resolve_config_path(str(raw), base_dir=config_dir)
     for root in claimed:
-        if state_path == root or state_path.is_relative_to(root):
+        if _is_inside(state_path, root):
             raise UnsafeStateLocationError(
                 "the state database would live inside a configured repository; move it "
                 "outside every repository named in the configuration",
                 state_db_path=str(state_path),
                 repository_root=str(root),
             )
+
+
+def _is_inside(candidate: Path, root: Path) -> bool:
+    """Whether ``candidate`` is ``root`` or lies beneath it, by identity where possible.
+
+    String comparison alone is not enough, and the gap fails *open*. ``Path.resolve`` is
+    case-preserving on POSIX, and ``is_relative_to`` is exact-case, so on macOS's default
+    case-insensitive filesystem a ``stateDbPath`` spelled ``~/projects/myapp/...`` against
+    an enrolled root of ``~/Projects/MyApp`` names the same directory on disk while
+    comparing as unrelated -- and the ledger lands inside the repository it judges.
+
+    The string comparison is kept as the first test because it works for paths that do not
+    exist yet, which the state database usually does not. The identity comparison then
+    walks up from the nearest ancestor that *does* exist and asks the filesystem, which
+    settles case-folding, hard links and any other spelling the operator might use.
+    """
+    if candidate == root or candidate.is_relative_to(root):
+        return True
+    if not root.exists():
+        return False
+
+    probe = candidate
+    while True:
+        if probe.exists():
+            try:
+                if probe.samefile(root):
+                    return True
+            except OSError:  # pragma: no cover - racing filesystem
+                return False
+        if probe.parent == probe:
+            return False
+        probe = probe.parent

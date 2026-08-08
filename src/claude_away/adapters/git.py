@@ -62,11 +62,13 @@ from claude_away.errors import (
     GitOutputError,
     NotAGitRepositoryError,
     UnsafeRepositoryConfigError,
+    UnsupportedGitVersionError,
     UnsupportedRepositoryError,
 )
 
 __all__ = [
     "GIT_TIMEOUT_SECONDS",
+    "MINIMUM_GIT_VERSION",
     "GitRunner",
     "RepositoryInspection",
     "RepositoryOperation",
@@ -76,6 +78,14 @@ __all__ = [
     "is_safe_ref",
     "resolve_local_ref",
 ]
+
+MINIMUM_GIT_VERSION = "2.26"
+"""The oldest Git this adapter works with.
+
+Set by the newest flag in use: ``--porcelain=v2`` needs 2.11, ``--absolute-git-dir`` 2.13,
+``--no-optional-locks`` 2.15, and ``git config --list --show-scope`` -- which the
+repository-configuration audit depends on -- needs 2.26.
+"""
 
 GIT_TIMEOUT_SECONDS = 60
 """Every Git call is bounded. An unattended run must not hang forever on a stuck lock."""
@@ -196,6 +206,16 @@ class WorktreeStatus:
     untracked: tuple[str, ...] = ()
     unmerged: tuple[str, ...] = ()
     submodules: tuple[SubmoduleState, ...] = ()
+    unverifiable: tuple[str, ...] = ()
+    """Paths whose index bits stop ``git status`` from reporting them at all.
+
+    ``git update-index --assume-unchanged`` and ``--skip-worktree`` are ordinary developer
+    habits for a local config file, and they tell Git not to look. ``git status`` then says
+    nothing about the path even when its content differs from HEAD -- and the difference
+    survives ``git checkout -b``, so it *would* be carried into a new branch. These are not
+    known-dirty paths; they are paths whose cleanliness cannot be established, which for
+    this purpose is the same answer.
+    """
 
     @property
     def is_clean(self) -> bool:
@@ -204,9 +224,18 @@ class WorktreeStatus:
         Untracked files count. They are the ones most likely to be accidentally added by a
         broad ``git add``, and a task that starts on top of them cannot say afterwards
         which changes were its own.
+
+        So do paths Git has been told not to check. "We looked and found nothing" and "we
+        were told not to look" are different statements, and only the first supports a
+        claim that the tree is clean.
         """
         return not (
-            self.staged or self.unstaged or self.untracked or self.unmerged or self.dirty_submodules
+            self.staged
+            or self.unstaged
+            or self.untracked
+            or self.unmerged
+            or self.dirty_submodules
+            or self.unverifiable
         )
 
     @property
@@ -221,6 +250,7 @@ class WorktreeStatus:
             "untracked": list(self.untracked),
             "unmerged": list(self.unmerged),
             "dirty_submodules": [module.path for module in self.dirty_submodules],
+            "unverifiable": list(self.unverifiable),
         }
 
 
@@ -350,6 +380,26 @@ class GitRunner:
         completed = self.run(*arguments, check=check)
         return completed.stdout.decode("utf-8", "replace").strip()
 
+    def path(self, *arguments: str, check: bool = True) -> Path:
+        """Read a filesystem path from Git's output, without damaging it.
+
+        :meth:`text` is wrong for paths in two ways that only show up on the unusual
+        repository. It strips *all* trailing whitespace, so a directory legitimately named
+        ``trail `` came back as ``trail`` -- a path that does not exist, which then produced
+        an unfollowable error telling the operator to enrol a root they cannot enrol. And it
+        decodes with ``errors="replace"``, so a path containing a non-UTF-8 byte became one
+        containing U+FFFD; the git directory then did not exist, and interrupted-operation
+        detection -- pure filesystem probing against that path -- silently returned "no
+        operation in progress" for a repository sitting in a conflicted merge.
+
+        ``os.fsdecode`` round-trips through ``os.fsencode``, and only the trailing newline
+        Git appends is removed.
+        """
+        raw = self.run(*arguments, check=check).stdout
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        return Path(os.fsdecode(raw))
+
 
 def _decode(raw: bytes) -> str:
     """Decode a path from Git.
@@ -361,7 +411,7 @@ def _decode(raw: bytes) -> str:
     return raw.decode("utf-8", "surrogateescape")
 
 
-def _parse_porcelain_v2(payload: bytes) -> WorktreeStatus:
+def _parse_porcelain_v2(payload: bytes, *, unverifiable: tuple[str, ...] = ()) -> WorktreeStatus:
     """Parse ``git status --porcelain=v2 -z`` output.
 
     The subtlety that breaks naive parsers: with ``-z`` a rename/copy entry (``2``) is
@@ -457,6 +507,7 @@ def _parse_porcelain_v2(payload: bytes) -> WorktreeStatus:
         untracked=tuple(untracked),
         unmerged=tuple(unmerged),
         submodules=tuple(submodules),
+        unverifiable=unverifiable,
     )
 
 
@@ -512,6 +563,28 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path) -> None:
             path=str(path),
             keys=offenders,
         )
+
+
+def _unverifiable_paths(runner: GitRunner) -> tuple[str, ...]:
+    """Paths flagged ``assume-unchanged`` or ``skip-worktree`` in the index.
+
+    ``git ls-files -v`` tags each entry with a letter; the letter is lower-cased when the
+    entry is assume-unchanged, and ``S`` marks skip-worktree. Both make ``git status``
+    silent about the path regardless of its content, which is why they have to be read
+    separately -- status output cannot report what status does not look at.
+    """
+    completed = runner.run("ls-files", "-v", "-z", check=False)
+    if completed.returncode != 0:
+        return ()
+
+    flagged: list[str] = []
+    for record in completed.stdout.split(b"\x00"):
+        if len(record) < 3 or record[1:2] != b" ":
+            continue
+        tag = record[0:1]
+        if tag.islower() or tag == b"S":
+            flagged.append(_decode(record[2:]))
+    return tuple(flagged)
 
 
 def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
@@ -619,10 +692,22 @@ def inspect_repository(
 
     inside = runner.run("rev-parse", "--is-inside-work-tree", check=False)
     if inside.returncode != 0:
+        stderr = inside.stderr.decode("utf-8", "replace")
+        if "unknown option" in stderr or "unknown switch" in stderr:
+            # An option this build relies on was rejected, which means the Git on PATH is
+            # older than the adapter requires -- not that the path is not a repository.
+            # Reporting it as "not a repository" sent the operator to check their config
+            # when the problem was their toolchain.
+            raise UnsupportedGitVersionError(
+                f"the installed git does not accept an option this build requires; "
+                f"git {MINIMUM_GIT_VERSION} or newer is needed",
+                path=str(path),
+                stderr=stderr[:_MAX_STDERR_CHARS],
+            )
         raise NotAGitRepositoryError(
             "path is not inside a Git working tree",
             path=str(path),
-            stderr=inside.stderr.decode("utf-8", "replace")[:_MAX_STDERR_CHARS],
+            stderr=stderr[:_MAX_STDERR_CHARS],
         )
     # Bare is checked *before* "not a working tree", because a bare repository answers
     # `false` to both questions and would otherwise get the vaguer of the two messages.
@@ -644,11 +729,11 @@ def inspect_repository(
     # filter driver. `rev-parse` above reads no worktree content and triggers nothing.
     _assert_configuration_is_inert(runner, path)
 
-    root = Path(runner.text("rev-parse", "--show-toplevel")).resolve()
-    git_dir = Path(runner.text("rev-parse", "--absolute-git-dir"))
+    root = runner.path("rev-parse", "--show-toplevel").resolve()
+    git_dir = runner.path("rev-parse", "--absolute-git-dir")
     # `--git-common-dir` may come back relative (".git") depending on the Git version, so
     # it is anchored to the working tree root rather than to the process cwd.
-    common_dir = Path(runner.text("rev-parse", "--git-common-dir"))
+    common_dir = runner.path("rev-parse", "--git-common-dir")
     if not common_dir.is_absolute():
         common_dir = (root / common_dir).resolve()
     common_dir = common_dir.resolve()
@@ -688,7 +773,7 @@ def inspect_repository(
         head_commit=head_commit,
         branch=branch,
         is_detached=is_detached,
-        status=_parse_porcelain_v2(status_output),
+        status=_parse_porcelain_v2(status_output, unverifiable=_unverifiable_paths(runner)),
         operations_in_progress=_operations_in_progress(git_dir),
         default_branch=default_branch,
         default_branch_source=default_branch_source,

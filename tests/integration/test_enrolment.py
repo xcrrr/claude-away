@@ -548,3 +548,40 @@ class TestLinkedWorktrees:
             config_dir=tmp_path,
         )
         assert len(enrolment.repositories) == 2
+
+
+class TestStateDbBoundaryUsesFilesystemIdentity:
+    """String comparison alone leaves the boundary open on a case-insensitive filesystem.
+
+    `Path.resolve` is case-preserving on POSIX and `is_relative_to` is exact-case, so on
+    macOS a stateDbPath spelled `~/projects/myapp/...` against an enrolled root of
+    `~/Projects/MyApp` names the same directory while comparing as unrelated -- and the
+    ledger lands inside the repository it judges. That filesystem cannot be created here,
+    so the identity path is exercised through a spelling difference Linux does have.
+    """
+
+    def test_a_differently_spelled_root_still_triggers_the_guard(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _is_inside
+
+        real = tmp_path / "repo"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+
+        candidate = real / ".claude-away" / "state.db"
+        assert not candidate.exists()
+        # The string test cannot see it: neither path is a prefix of the other.
+        assert not candidate.is_relative_to(alias)
+        assert _is_inside(candidate, alias)
+
+    def test_an_unrelated_path_is_still_allowed(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _is_inside
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        assert not _is_inside(tmp_path / "elsewhere" / "state.db", repo)
+
+    def test_a_root_that_does_not_exist_does_not_crash(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _is_inside
+
+        assert not _is_inside(tmp_path / "a" / "b.db", tmp_path / "gone")

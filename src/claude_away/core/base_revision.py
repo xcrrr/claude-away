@@ -40,6 +40,7 @@ class BaseRefusal(str, Enum):
     UNMERGED_PATHS = "unmerged_paths"
     OPERATION_IN_PROGRESS = "operation_in_progress"
     DIRTY_SUBMODULES = "dirty_submodules"
+    UNVERIFIABLE_PATHS = "unverifiable_paths"
     UNKNOWN_DEFAULT_BRANCH = "unknown_default_branch"
     MISSING_REF = "missing_ref"
     UNEXPECTED_BRANCH = "unexpected_branch"
@@ -117,6 +118,20 @@ def resolve_expected_base(
     if require_clean and status.dirty_submodules:
         refusals.append(BaseRefusal.DIRTY_SUBMODULES)
         detail["dirty_submodules"] = [module.path for module in status.dirty_submodules]
+
+    if require_clean and status.unverifiable:
+        # Its own refusal rather than folding into DIRTY_WORKTREE, because the operator's
+        # next action is different and not guessable from "dirty": these paths may well be
+        # unmodified, but `git update-index --assume-unchanged` / `--skip-worktree` has told
+        # Git not to look, so nothing can establish that they are. The message says which
+        # command undoes it.
+        refusals.append(BaseRefusal.UNVERIFIABLE_PATHS)
+        detail["unverifiable"] = list(status.unverifiable)
+        detail["unverifiable_hint"] = (
+            "these paths are marked assume-unchanged or skip-worktree, so `git status` "
+            "cannot report whether they differ from HEAD; clear the bit with "
+            "`git update-index --no-assume-unchanged <path>` or `--no-skip-worktree <path>`"
+        )
 
     target_branch = expected_branch or inspection.default_branch
     if target_branch is None:

@@ -26,10 +26,11 @@ import pytest
 from claude_away.adapters.git import (
     _PINNED_CONFIG,
     GitRunner,
+    RepositoryOperation,
     _repository_defined_command_config,
     inspect_repository,
 )
-from claude_away.errors import UnsafeRepositoryConfigError
+from claude_away.errors import UnsafeRepositoryConfigError, UnsupportedGitVersionError
 from tests.gitfixtures import make_repo
 
 
@@ -272,3 +273,118 @@ class TestDiscoveredDefaultBranchProvenance:
         inspection = inspect_repository(repo.path)
         assert inspection.default_branch is None
         assert inspection.default_branch_source is None
+
+
+class TestIndexBitsCannotHideChanges:
+    """`git status` does not report what the index tells it not to look at."""
+
+    @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+    def test_a_hidden_modification_is_not_reported_clean(self, tmp_path: Path, flag: str) -> None:
+        repo = make_repo(tmp_path / "r")
+        repo.write("local.conf", "original\n")
+        repo.commit_all("add config")
+        repo.write("local.conf", "MODIFIED\n")
+        repo.git("update-index", flag, "local.conf")
+
+        # Ground truth: git status really does say nothing about it.
+        assert repo.git("status", "--porcelain=v2", "-z").stdout == ""
+
+        status = inspect_repository(repo.path).status
+        assert status.unverifiable == ("local.conf",)
+        assert not status.is_clean
+
+    @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+    def test_the_base_refuses_with_an_actionable_reason(self, tmp_path: Path, flag: str) -> None:
+        from claude_away.core.base_revision import BaseRefusal, resolve_expected_base
+
+        repo = make_repo(tmp_path / "r")
+        repo.write("local.conf", "original\n")
+        repo.commit_all("add config")
+        repo.git("update-index", flag, "local.conf")
+
+        inspection = inspect_repository(repo.path, configured_default_branch="main")
+        resolution = resolve_expected_base(inspection, project_id="api")
+
+        assert not resolution.resolved
+        assert BaseRefusal.UNVERIFIABLE_PATHS in resolution.refusals
+        assert "update-index" in resolution.detail["unverifiable_hint"]
+
+    def test_the_change_really_would_be_carried_into_a_new_branch(self, tmp_path: Path) -> None:
+        """Why this is a refusal and not a warning."""
+        repo = make_repo(tmp_path / "r")
+        repo.write("local.conf", "original\n")
+        repo.commit_all("add config")
+        repo.write("local.conf", "MODIFIED\n")
+        repo.git("update-index", "--assume-unchanged", "local.conf")
+
+        repo.git("checkout", "-q", "-b", "claude-away-demo")
+        assert (repo.path / "local.conf").read_text(encoding="utf-8") == "MODIFIED\n"
+
+    def test_an_ordinary_repository_has_nothing_unverifiable(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "r")
+        status = inspect_repository(repo.path).status
+        assert status.unverifiable == ()
+        assert status.is_clean
+
+
+class TestPathsSurviveInspection:
+    def test_a_root_ending_in_a_space_is_not_truncated(self, tmp_path: Path) -> None:
+        """`.strip()` removed the trailing space along with git's newline.
+
+        The result was a root that does not exist, and an enrolment error telling the
+        operator to enrol a repository root they cannot enrol.
+        """
+        repo = make_repo(tmp_path / "trailing space ")
+        inspection = inspect_repository(repo.path)
+        assert str(inspection.root).endswith("trailing space ")
+        assert inspection.root.exists()
+
+    def test_a_non_utf8_root_keeps_operation_detection_working(self, tmp_path: Path) -> None:
+        """`errors="replace"` produced a git_dir that did not exist.
+
+        Interrupted-operation detection is pure filesystem probing against that path, so it
+        returned "nothing in progress" for a repository sitting in a conflicted merge.
+        """
+        awkward = tmp_path / os.fsdecode(b"repo\xffdir")
+        repo = make_repo(awkward)
+        repo.write("f.txt", "base\n")
+        repo.commit_all("base")
+        repo.git("checkout", "-q", "-b", "side")
+        repo.write("f.txt", "side\n")
+        repo.commit_all("side")
+        repo.git("checkout", "-q", "main")
+        repo.write("f.txt", "main\n")
+        repo.commit_all("main")
+        repo.git("merge", "side", check=False)
+
+        inspection = inspect_repository(awkward)
+        assert inspection.git_dir.exists()
+        assert RepositoryOperation.MERGE in inspection.operations_in_progress
+
+
+class TestGitVersionDiagnostic:
+    def test_an_option_this_build_needs_is_reported_as_a_version_problem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not as "path is not a Git repository", which sent operators to check the config."""
+        repo = make_repo(tmp_path / "r")
+
+        shim_dir = tmp_path / "oldgit"
+        shim_dir.mkdir()
+        shim = shim_dir / "git"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'for a in "$@"; do\n'
+            '  case "$a" in --no-optional-locks)\n'
+            '    echo "error: unknown option \\`no-optional-locks\'" >&2; exit 129;;\n'
+            "  esac\n"
+            "done\n"
+            f"exec {subprocess.run(['which', 'git'], capture_output=True, text=True).stdout.strip()}"
+            ' "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+
+        with pytest.raises(UnsupportedGitVersionError, match=r"2\.26"):
+            inspect_repository(repo.path)

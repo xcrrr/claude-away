@@ -54,6 +54,7 @@ __all__ = [
     "TaskLeasedError",
     "UnsafeRepositoryConfigError",
     "UnsafeStateLocationError",
+    "UnsupportedGitVersionError",
     "UnsupportedRepositoryError",
     "ValidationError",
 ]
@@ -425,6 +426,17 @@ class NotAGitRepositoryError(GitError):
     """The path exists but is not inside a Git working tree."""
 
     code = "not_a_git_repository"
+
+
+class UnsupportedGitVersionError(GitError):
+    """The installed Git is older than this build requires.
+
+    Its own class because the operator's next action -- upgrade Git -- shares nothing with
+    the action for any other Git failure, and because the alternative was reporting a
+    perfectly good repository as "not a Git repository".
+    """
+
+    code = "unsupported_git_version"
 
 
 class UnsafeRepositoryConfigError(UnsupportedRepositoryError):
