@@ -366,6 +366,10 @@ class TestReposIsolatesPerRepositoryFailures:
 
         healthy = make_repo(tmp_path / "healthy")
         broken = make_repo(tmp_path / "broken")
+        # A repository-local command key is caught by `_enrol_one`, so this exercises
+        # enrolment's per-project failure recording. `cmd_repos`' own GitError boundary is
+        # covered separately below -- naming a class after a guard is not the same as
+        # reaching it.
         broken.git("config", "filter.evil.clean", "/bin/true")
 
         document = config_document()
@@ -582,3 +586,96 @@ class TestProtectedBranchesAreATrueUnion:
         assert payload["protected_branches"] == ["decoy", "main"], (
             "the declared branch must survive a decoy, and the decoy must only add"
         )
+
+
+class TestReposOwnErrorBoundary:
+    """`cmd_repos` catches GitError around inspection and base resolution.
+
+    The class named for this previously built its broken repository with a config key that
+    `_enrol_one` rejects, so the failure never reached `cmd_repos` at all and its `except`
+    branch was never executed. This reaches it by making resolution itself fail.
+    """
+
+    def test_a_failure_after_enrolment_is_reported_against_its_project(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from claude_away.errors import GitCommandError
+        from tests.gitfixtures import make_repo
+
+        healthy = make_repo(tmp_path / "healthy")
+        awkward = make_repo(tmp_path / "awkward")
+
+        document = config_document()
+        document["projects"] = [
+            {"id": "awkward", "path": str(awkward.path), "defaultBranch": "main"},
+            {"id": "healthy", "path": str(healthy.path), "defaultBranch": "main"},
+        ]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        real = main.__globals__["resolve_expected_base"]
+
+        def failing(inspection: object, **kwargs: object) -> object:
+            if kwargs.get("project_id") == "awkward":
+                raise GitCommandError(["git", "rev-parse"], 128, "simulated post-enrolment failure")
+            return real(inspection, **kwargs)
+
+        monkeypatch.setitem(main.__globals__, "resolve_expected_base", failing)
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+        by_id = {entry["project_id"]: entry for entry in payload["repositories"]}
+
+        assert by_id["awkward"]["error"]["code"] == "git_command_failed"
+        assert by_id["healthy"]["base"]["resolved"] is True
+
+
+class TestUnreadableConfigFiles:
+    @pytest.mark.parametrize("command", ["validate-config", "repos", "policy"])
+    def test_a_non_utf8_config_is_an_error_not_a_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """UnicodeDecodeError is a ValueError, not an OSError, so it escaped the handler."""
+        path = tmp_path / "config.json"
+        path.write_bytes(b"\xff\xfe{\x00}\x00")
+
+        assert main(["--json", command, str(path)]) == 1
+        assert json.loads(capsys.readouterr().out)["code"] == "unreadable_file"
+
+
+class TestPolicyDegradesAudibly:
+    def test_a_project_whose_repository_cannot_be_read_is_reported_as_unknown(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "No protected branches" and "we could not check" must not look the same.
+
+        The `except ClaudeAwayError` fallback returned an empty `unknown`, which asserted
+        that every project's default branch was accounted for when none had been checked.
+        """
+        document = config_document()
+        document["projects"] = [{"id": "gone", "path": str(tmp_path / "missing")}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["projects_with_unknown_default_branch"] == ["gone"]
+
+
+class TestXdgStateHome:
+    def test_a_relative_value_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The spec says a relative value is invalid; honouring one restored the cwd default."""
+        from claude_away.cli.main import default_db_path
+
+        monkeypatch.setenv("XDG_STATE_HOME", "relative-state")
+        assert default_db_path().is_absolute()
+
+    def test_an_absolute_value_is_used(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from claude_away.cli.main import default_db_path
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert default_db_path() == tmp_path / "claude-away" / "state.db"

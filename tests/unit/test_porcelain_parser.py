@@ -82,11 +82,19 @@ class TestWellFormedInput:
         assert status.unstaged == ("dir with spaces/file name.txt",)
 
     def test_invalid_utf8_path_round_trips(self) -> None:
-        """A repository must not become uninspectable because one filename is odd bytes."""
-        payload = record(b"? bad-\xff-name.txt")
-        status = _parse_porcelain_v2(payload)
+        """A repository must not become uninspectable because one filename is odd bytes.
+
+        Asserting the round trip, not a prefix. `startswith("bad-")` was equally true of the
+        lossy `errors="replace"` decoding that turns the byte into U+FFFD -- the decoding the
+        module explicitly does not use, because a path that cannot be re-encoded is a path
+        the filesystem checks silently stop working on.
+        """
+        import os
+
+        raw = b"bad-\xff-name.txt"
+        status = _parse_porcelain_v2(record(b"? " + raw))
         assert len(status.untracked) == 1
-        assert status.untracked[0].startswith("bad-")
+        assert os.fsencode(status.untracked[0]) == raw
 
 
 class TestSubmoduleField:

@@ -131,7 +131,15 @@ class PolicyDecision:
 
 #: Characters that look like a glob. Protected paths are matched component-wise, not by
 #: globbing, so an entry containing these would silently protect nothing.
-_GLOB_CHARACTERS = ("*", "?", "[")
+#:
+#: ``[`` is deliberately NOT here. It is a glob metacharacter, but it is also an ordinary
+#: character in ordinary filenames: ``app/[slug]/page.tsx`` is how Next.js, SvelteKit and
+#: Remix spell a dynamic route, and those directories exist in a large share of real web
+#: repositories. Refusing it made a legitimate protected path impossible to express *and*
+#: hard-failed the whole configuration -- turning a safeguard into an outage for the people
+#: most likely to want a protected path. ``*`` and ``?`` stay, because a filename containing
+#: either is rare enough that refusing it is the right trade.
+_GLOB_CHARACTERS = ("*", "?")
 
 
 def normalise_repo_path(path: str) -> PurePosixPath:
@@ -152,7 +160,11 @@ def normalise_repo_path(path: str) -> PurePosixPath:
     treats anything it cannot normalise as protected, so the failure direction is closed.
     """
     cleaned = path.replace("\\", "/").strip()
-    if cleaned.startswith("/"):
+    # A drive letter is absolute too. Backslashes fold before this check, so `C:\repo\x`
+    # arrives as `C:/repo/x`, which does not start with "/" and was therefore accepted as a
+    # relative path called `C:` -- sharing no component with any protected entry, and so
+    # silently unprotected. That is the fail-open the POSIX branch exists to avoid.
+    if cleaned.startswith("/") or (len(cleaned) > 1 and cleaned[1] == ":" and cleaned[0].isalpha()):
         raise ValueError(
             f"path must be repository-relative, not absolute: {path!r}; relativise it "
             "against the repository root before asking whether it is protected"
@@ -196,6 +208,30 @@ def _validate_protected_paths(entries: Sequence[str]) -> tuple[str, ...]:
                 f"safety.protectedPaths entry cannot be honoured: {exc}", entry=entry
             ) from exc
         validated.append(entry)
+    return tuple(validated)
+
+
+def _validate_protected_branches(branches: Sequence[str]) -> tuple[str, ...]:
+    """Same shape check the paths get, for the reason written two lines above them.
+
+    ``tuple("main")`` is ``('m', 'a', 'i', 'n')``, which protects nothing. ``protectedPaths``
+    was guarded against exactly this; its sibling was not, so a caller passing a bare string
+    -- the single easiest mistake to make with either field -- silently unprotected every
+    branch while ``awayctl policy`` printed four one-letter entries that look like noise
+    rather than like a failure.
+    """
+    if isinstance(branches, str) or not isinstance(branches, Sequence):
+        raise ValidationError(
+            "protected branches must be a list of strings, not a single string",
+            protected_branches=repr(branches),
+        )
+    validated: list[str] = []
+    for branch in branches:
+        if branch is None or branch == "":
+            continue
+        if not isinstance(branch, str):
+            raise ValidationError("protected branch entries must be strings", entry=repr(branch))
+        validated.append(branch)
     return tuple(validated)
 
 
@@ -277,7 +313,7 @@ class SafetyPolicy:
             allow_deploy=flag("allowDeploy"),
             allow_destructive=flag("allowDestructive"),
             protected_paths=_validate_protected_paths(list(paths)),
-            protected_branches=tuple(branch for branch in protected_branches if branch),
+            protected_branches=_validate_protected_branches(protected_branches),
         )
 
     # ---------------------------------------------------------------- protected paths

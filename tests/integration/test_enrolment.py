@@ -349,8 +349,23 @@ class TestModeGuard:
     def test_cloud_mode_is_not_enrolled_by_path(self, tmp_path: Path) -> None:
         document = config_document(mode="cloud")
         document["projects"] = [{"id": "api", "repository": "https://example.invalid/api.git"}]
-        with pytest.raises(EnrolmentError, match="local-mode"):
+        with pytest.raises(EnrolmentError) as caught:
             enrol_projects(document, config_dir=tmp_path)
+
+        # Asserting on the exact message, not `match="local-mode"`: with the mode guard
+        # deleted the cloud project falls through to "local-mode project has no path",
+        # which also contains that substring, so the test passed either way.
+        assert caught.value.details["mode"] == "cloud"
+        assert "only local-mode enrolment" in caught.value.message
+
+    def test_a_cloud_project_that_also_has_a_path_is_still_refused(self, tmp_path: Path) -> None:
+        """The guard is about the mode, not about the project happening to lack a path."""
+        repo = make_repo(tmp_path / "api")
+        document = config_document(mode="cloud")
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        with pytest.raises(EnrolmentError) as caught:
+            enrol_projects(document, config_dir=tmp_path)
+        assert caught.value.details["mode"] == "cloud"
 
 
 class TestConfiguredDefaultBranch:
@@ -690,3 +705,57 @@ class TestEnrolmentKeepsItsInspections:
             config_for(tmp_path, [{"id": "api", "path": str(plain)}]), config_dir=tmp_path
         )
         assert "api" not in enrolment.inspections
+
+
+class TestBothDuplicateGuardsAreExercised:
+    """Four duplicate tests all also shared a git-common-dir, so only one guard was pinned."""
+
+    def test_the_root_guard_fires_for_two_spellings_of_one_worktree(self, tmp_path: Path) -> None:
+        from claude_away.core.enrolment import _lookup
+
+        repo = make_repo(tmp_path / "api")
+        seen = {repo.path.resolve(): "first"}
+        assert _lookup(seen, repo.path.resolve()) == "first"
+
+    def test_the_error_names_the_root_when_roots_collide(self, tmp_path: Path) -> None:
+        """`repository_root` in the details is what distinguishes it from the worktree guard."""
+        repo = make_repo(tmp_path / "api")
+        link = tmp_path / "alias"
+        link.symlink_to(repo.path, target_is_directory=True)
+
+        with pytest.raises(DuplicateEnrolmentError) as caught:
+            enrol_projects(
+                config_for(
+                    tmp_path,
+                    [
+                        {"id": "api", "path": str(repo.path)},
+                        {"id": "alias", "path": str(link)},
+                    ],
+                ),
+                config_dir=tmp_path,
+            )
+        assert "repository_root" in caught.value.details
+        assert "same repository" in caught.value.message
+
+
+class TestFailedProjectsStillClaimTheirPath:
+    def test_the_state_db_cannot_hide_in_a_project_that_failed_to_enrol(
+        self, tmp_path: Path
+    ) -> None:
+        """A repository being unreadable today is no reason to let the ledger sit inside it.
+
+        The docstring said so; the single line implementing it (`claimed_paths.append` on
+        the failure branch) had no test, so deleting it was silent.
+        """
+        broken = make_repo(tmp_path / "broken")
+        broken.git("config", "filter.evil.clean", "/bin/true")
+
+        with pytest.raises(UnsafeStateLocationError):
+            enrol_projects(
+                config_for(
+                    tmp_path,
+                    [{"id": "broken", "path": str(broken.path)}],
+                    state_db=str(broken.path / "state.db"),
+                ),
+                config_dir=tmp_path,
+            )

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -86,10 +87,34 @@ class TestFsmonitorCannotExecute:
         assert "core.fsmonitor=false" in argv
 
     def test_every_pinned_key_is_actually_passed(self, tmp_path: Path) -> None:
+        """Asserted against a written-out list, not against `_PINNED_CONFIG` itself.
+
+        Iterating the constant under test made the check self-referential: deleting an entry
+        simply shrank the loop, so twelve of the thirteen pinned keys could be removed with
+        the suite green. The list below has to be edited deliberately, which is the point.
+        """
+        expected = {
+            "core.fsmonitor=false",
+            "core.hooksPath=/dev/null",
+            "core.pager=cat",
+            "core.editor=false",
+            "core.sshCommand=false",
+            "core.askPass=",
+            "core.gitProxy=",
+            "core.alternateRefsCommand=",
+            "credential.helper=",
+            "diff.external=",
+            "gpg.program=false",
+            "uploadpack.packObjectsHook=",
+            "protocol.ext.allow=never",
+        }
         repo = make_repo(tmp_path / "r")
-        argv = list(GitRunner(repo.path).run("rev-parse", "HEAD").args)
-        for key, value in _PINNED_CONFIG:
-            assert f"{key}={value}" in argv, key
+        argv = set(GitRunner(repo.path).run("rev-parse", "HEAD").args)
+
+        assert expected <= argv, f"no longer pinned: {sorted(expected - argv)}"
+        assert {f"{k}={v}" for k, v in _PINNED_CONFIG} == expected, (
+            "the pinned set changed; update the expectation deliberately, with a reason"
+        )
 
 
 class TestEnvironmentInjection:
@@ -202,26 +227,52 @@ class TestUnpinnableCommandKeysAreRefused:
 
         Refusing every LFS repository would be a bug wearing a safeguard's clothes. The
         operator's own configuration is trusted; the repository's is not.
+
+        The fixture cannot use `GIT_CONFIG_GLOBAL`, which is what an earlier version of this
+        test did: the adapter strips the whole `GIT_*` namespace, so the hostile global
+        config never reached the code under test and the assertion held vacuously. `HOME` is
+        not stripped, so pointing it at a throwaway directory is the way to give the child a
+        global config it will actually read.
         """
         repo = make_repo(tmp_path / "r")
-        global_config = tmp_path / "gitconfig"
-        global_config.write_text(
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(
             '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n', encoding="utf-8"
         )
 
-        runner = GitRunner(repo.path)
-        environment = dict(os.environ)
-        environment["GIT_CONFIG_GLOBAL"] = str(global_config)
-        completed = subprocess.run(
-            ["git", "-C", str(repo.path), "config", "--list", "--show-scope", "-z"],
-            capture_output=True,
-            env=environment,
-            timeout=60,
-            check=True,
-        )
-        scopes = {field.decode() for field in completed.stdout.split(b"\x00")[::2] if field}
-        assert "global" in scopes, "fixture did not actually install a global filter"
-        assert _repository_defined_command_config(runner) == []
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("HOME", str(home))
+            runner = GitRunner(repo.path)
+
+            # The guard is only meaningful if the global filter genuinely reaches the child.
+            raw = runner.run("config", "--list", "--show-scope", "-z").stdout
+            fields = [f for f in raw.split(b"\x00") if f]
+            scoped = list(zip(fields[::2], fields[1::2], strict=False))
+            assert any(
+                scope == b"global" and key.startswith(b"filter.lfs.clean") for scope, key in scoped
+            ), "fixture did not actually install a global filter the adapter can see"
+
+            assert _repository_defined_command_config(runner) == []
+
+    def test_a_worktree_scoped_command_key_is_refused(self, tmp_path: Path) -> None:
+        """`worktree` is half of `_UNTRUSTED_CONFIG_SCOPES` and nothing exercised it.
+
+        A repository can set `extensions.worktreeConfig` and write the key into
+        `.git/worktrees/<name>/config.worktree`, where plain `git config` never puts it.
+        """
+        repo = make_repo(tmp_path / "r")
+        repo.git("config", "extensions.worktreeConfig", "true")
+        repo.git("config", "--worktree", "filter.sneaky.clean", "/bin/true")
+
+        raw = GitRunner(repo.path).run("config", "--list", "--show-scope", "-z").stdout
+        fields = [f for f in raw.split(b"\x00") if f]
+        scopes = set(fields[::2])
+        assert b"worktree" in scopes, "fixture did not produce worktree scope"
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert "filter.sneaky.clean" in caught.value.details["keys"]
 
     def test_an_ordinary_repository_is_not_refused(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "r")
@@ -590,3 +641,43 @@ class TestSubmoduleReportingCannotBeSuppressed:
         status = inspect_repository(root).status
         assert not status.is_clean
         assert [m.path for m in status.dirty_submodules] == ["sub"]
+
+
+class TestEveryGitCallIsBounded:
+    def test_the_timeout_reaches_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`GIT_TIMEOUT_SECONDS` appeared in no test: dropping `timeout=` was silent.
+
+        An unattended run that hangs forever on a stuck lock is the failure the bound exists
+        to prevent, and "forever" is not something a test suite notices by waiting.
+        """
+        import subprocess as subprocess_module
+
+        seen: dict[str, Any] = {}
+        real_run = subprocess_module.run
+
+        def recording_run(*args: Any, **kwargs: Any) -> Any:
+            seen.update(kwargs)
+            return real_run(*args, **kwargs)
+
+        repo = make_repo(tmp_path / "r")
+        monkeypatch.setattr("claude_away.adapters.git.subprocess.run", recording_run)
+        GitRunner(repo.path, timeout=17).run("rev-parse", "HEAD")
+
+        assert seen["timeout"] == 17
+
+    def test_a_timeout_becomes_a_typed_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as subprocess_module
+
+        from claude_away.errors import GitCommandError
+
+        def always_timeout(*args: Any, **kwargs: Any) -> Any:
+            raise subprocess_module.TimeoutExpired(cmd="git", timeout=1)
+
+        repo = make_repo(tmp_path / "r")
+        monkeypatch.setattr("claude_away.adapters.git.subprocess.run", always_timeout)
+        with pytest.raises(GitCommandError, match="timed out"):
+            GitRunner(repo.path).run("rev-parse", "HEAD")

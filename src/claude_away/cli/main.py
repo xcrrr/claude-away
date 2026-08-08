@@ -68,7 +68,10 @@ def default_db_path() -> Path:
     that supervises several repositories at once.
     """
     root = os.environ.get("XDG_STATE_HOME")
-    base = Path(root) if root else Path.home() / ".local" / "state"
+    # The XDG spec says a relative value is invalid and must be ignored. Honouring one would
+    # reintroduce the exact property this function was rewritten to remove: a default that
+    # resolves against whatever directory the shell happens to be in.
+    base = Path(root) if root and Path(root).is_absolute() else Path.home() / ".local" / "state"
     return base / "claude-away" / "state.db"
 
 
@@ -516,7 +519,17 @@ def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[lis
         # The matrix is still worth printing when the repositories cannot be read -- the
         # flags are a property of the configuration, not of the filesystem -- so a failure
         # here degrades to "configured branches only" instead of taking the command down.
-        return sorted(branches), unknown
+        #
+        # But it must degrade *audibly*. Returning an empty `unknown` here said "every
+        # project's default branch is accounted for" when in fact none had been checked,
+        # collapsing the distinction the function exists to preserve. Every project without
+        # a declaration is unknown, because that is exactly what we failed to find out.
+        undeclared = [
+            str(project.get("id", "<unnamed>"))
+            for project in document.get("projects", [])
+            if not project.get("defaultBranch")
+        ]
+        return sorted(branches), sorted(undeclared)
 
     for repository in enrolment.repositories:
         # Both, not whichever one won. `_resolve_default_branch` returns the configured
@@ -625,8 +638,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"error [{error.code}]: {error}", file=sys.stderr)
         return EXIT_DOMAIN
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        # UnicodeDecodeError is a ValueError, not an OSError, so a configuration file that is
+        # UTF-16, carries the wrong BOM, or is simply not text produced a Python traceback
+        # from every config-reading command rather than an error message and exit 1.
+        message = {"code": "unreadable_file", "message": str(error)}
+        if args.json:
+            print(json.dumps(message, indent=2, sort_keys=True))
+        else:
+            print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
 

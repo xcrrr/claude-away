@@ -387,7 +387,7 @@ class TestProtectedPathsThatCannotBeHonoured:
         with pytest.raises(ValidationError, match="cannot be honoured"):
             SafetyPolicy.from_config({"safety": {"protectedPaths": [entry]}})
 
-    @pytest.mark.parametrize("entry", ["infra/**", "infra/*", "secrets/*.env", "log[0-9]"])
+    @pytest.mark.parametrize("entry", ["infra/**", "infra/*", "secrets/*.env", "logs/?"])
     def test_glob_entries_are_refused(self, entry: str) -> None:
         """Matching is component-wise, so a glob entry equals no real path.
 
@@ -396,6 +396,20 @@ class TestProtectedPathsThatCannotBeHonoured:
         """
         with pytest.raises(ValidationError, match="glob"):
             SafetyPolicy.from_config({"safety": {"protectedPaths": [entry]}})
+
+    @pytest.mark.parametrize("entry", ["app/[slug]", "app/[...catchall]/page.tsx", "routes/[id]"])
+    def test_bracketed_dynamic_routes_are_accepted(self, entry: str) -> None:
+        """`[` is a glob metacharacter and an ordinary filename character.
+
+        `app/[slug]/page.tsx` is how Next.js, SvelteKit and Remix spell a dynamic route.
+        Refusing it made a legitimate protected path impossible to express *and* hard-failed
+        the whole configuration -- a safeguard turning into an outage for exactly the people
+        most likely to want protected paths. Matching is literal and component-wise, so the
+        entry works as written.
+        """
+        policy = SafetyPolicy.from_config({"safety": {"protectedPaths": [entry]}})
+        assert policy.is_path_protected(entry)
+        assert policy.is_path_protected(f"{entry}/nested.txt")
 
     def test_an_absolute_entry_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="cannot be honoured"):
@@ -466,3 +480,38 @@ class TestTheDefaultIsDenial:
             Operation.CREATE_WORKTREE,
         ):
             assert not policy.evaluate(operation).allowed, operation
+
+
+class TestProtectedBranchesHaveTheSameShapeCheck:
+    """`tuple("main")` is ('m','a','i','n'). protectedPaths was guarded; its sibling was not."""
+
+    def test_a_bare_string_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="list of strings"):
+            SafetyPolicy.from_config(config_document(), protected_branches="main")
+
+    def test_a_non_string_entry_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="must be strings"):
+            SafetyPolicy.from_config(config_document(), protected_branches=[1])  # type: ignore[list-item]
+
+    def test_a_proper_list_still_works(self) -> None:
+        policy = SafetyPolicy.from_config(config_document(), protected_branches=["main", "release"])
+        assert policy.is_branch_protected("main")
+        assert policy.is_branch_protected("release")
+
+
+class TestWindowsAbsolutePathsFailClosed:
+    def test_a_drive_letter_is_absolute_too(self) -> None:
+        """Backslashes fold first, so `C:\\repo\\x` arrived as `C:/repo/x` -- which does not
+        start with "/" and was accepted as a relative path named `C:`, sharing no component
+        with any entry and therefore silently unprotected."""
+        with pytest.raises(ValueError, match="repository-relative"):
+            normalise_repo_path("C:\\repo\\infra\\deploy.tf")
+
+    def test_the_policy_treats_it_as_protected(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_paths=("infra",))
+        assert policy.is_path_protected("C:\\repo\\infra\\deploy.tf")
+        assert not policy.evaluate(Operation.COMMIT, paths=["D:/anything"]).allowed
+
+    def test_an_ordinary_path_beginning_with_a_letter_is_unaffected(self) -> None:
+        assert str(normalise_repo_path("c/src/app.py")) == "c/src/app.py"
+        assert str(normalise_repo_path("app/[slug]/page.tsx")) == "app/[slug]/page.tsx"
