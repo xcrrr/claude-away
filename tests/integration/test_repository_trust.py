@@ -395,8 +395,21 @@ class TestPathsSurviveInspection:
 
         Interrupted-operation detection is pure filesystem probing against that path, so it
         returned "nothing in progress" for a repository sitting in a conflicted merge.
+
+        Skipped where the filesystem will not hold the name. APFS and HFS+ enforce valid
+        UTF-8 and reject this directory with EILSEQ, so on macOS the *fixture* is impossible
+        even though the decoding bug it guards is real. The skip is decided by attempting
+        the directory rather than by testing ``sys.platform``: a platform check is a guess
+        about filesystems, and the runner's filesystem is the thing that actually matters.
+        ``test_a_non_utf8_path_from_git_round_trips`` covers the same decode path everywhere,
+        including macOS, so the guard is not left unpinned on the platform that skips this.
         """
         awkward = tmp_path / os.fsdecode(b"repo\xffdir")
+        try:
+            awkward.mkdir()
+        except OSError as exc:  # pragma: no cover - filesystem-dependent
+            pytest.skip(f"this filesystem rejects non-UTF-8 filenames: {exc}")
+
         repo = make_repo(awkward)
         repo.write("f.txt", "base\n")
         repo.commit_all("base")
@@ -452,6 +465,51 @@ class TestTheAuditFailsClosed:
         """Exit 1 with no output means "nothing to list", which is not a failure."""
         repo = make_repo(tmp_path / "r")
         assert _repository_defined_command_config(GitRunner(repo.path)) == []
+
+
+class TestNonUtf8PathsDecodePortably:
+    """The decode half of the same guard, on every filesystem.
+
+    The on-disk test above cannot run where the filesystem enforces valid UTF-8 (APFS,
+    HFS+), which is exactly where a regression would then go unnoticed. This drives
+    `GitRunner.path` with the bytes Git would emit, so the round-trip property is pinned on
+    macOS and Windows filesystems too -- no directory of that name required.
+    """
+
+    def test_a_non_utf8_path_from_git_round_trips(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as subprocess_module
+
+        raw = b"/tmp/repo\xffdir"
+        repo = make_repo(tmp_path / "r")
+
+        def fake_run(*args: Any, **kwargs: Any) -> Any:
+            return subprocess_module.CompletedProcess(
+                args=["git"], returncode=0, stdout=raw + b"\n", stderr=b""
+            )
+
+        monkeypatch.setattr("claude_away.adapters.git.subprocess.run", fake_run)
+        decoded = GitRunner(repo.path).path("rev-parse", "--show-toplevel")
+
+        assert os.fsencode(decoded) == raw, "the path must survive as the bytes Git emitted"
+
+    def test_a_trailing_space_is_not_stripped_from_git_output(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`.strip()` removed the space along with the newline; only the newline should go."""
+        import subprocess as subprocess_module
+
+        raw = b"/tmp/trailing space "
+        repo = make_repo(tmp_path / "r")
+
+        def fake_run(*args: Any, **kwargs: Any) -> Any:
+            return subprocess_module.CompletedProcess(
+                args=["git"], returncode=0, stdout=raw + b"\n", stderr=b""
+            )
+
+        monkeypatch.setattr("claude_away.adapters.git.subprocess.run", fake_run)
+        assert os.fsencode(GitRunner(repo.path).path("rev-parse", "--show-toplevel")) == raw
 
 
 class TestGitVersionDiagnostic:

@@ -473,7 +473,10 @@ class TestInitRefusesToLiveInsideARepository:
 
         assert main(["--json", "init"]) == EXIT_OK
         payload = json.loads(capsys.readouterr().out)
-        assert payload["path"].startswith(str(tmp_path / "state"))
+        # Compared after resolve() on both sides: `cmd_init` emits a resolved path, and on
+        # macOS the temp root is reached through /var -> /private/var, so a raw string
+        # prefix check would be asserting a platform detail rather than the behaviour.
+        assert Path(payload["path"]).resolve().is_relative_to((tmp_path / "state").resolve())
         assert not (repo.path / ".claude-away").exists()
         assert inspect_repository(repo.path).status.is_clean
 
