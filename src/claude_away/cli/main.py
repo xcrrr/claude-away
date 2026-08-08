@@ -170,15 +170,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 }
             )
 
-        # A RUNNING or VERIFYING task with no live attempt means a process died between
-        # writing the status and writing the attempt -- which the transaction discipline
-        # should make impossible. If it ever appears, something is genuinely wrong.
+        # A RUNNING or VERIFYING task with no live attempt is NOT corruption: it is what
+        # suspend_attempt leaves behind on a rate limit, a pause or a clean shutdown, and
+        # STATE_MODEL treats that as a supported state. It does need attention -- the task
+        # cannot progress until a new attempt starts -- so it is reported, but as the
+        # resumable condition it actually is rather than as a broken invariant.
         for task_id, node in sorted(nodes.items()):
             if (
                 node.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING)
                 and active_attempt(db, task_id) is None
             ):
-                problems.append({"kind": "active_task_without_attempt", "task_id": task_id})
+                problems.append(
+                    {
+                        "kind": "task_awaiting_resume",
+                        "task_id": task_id,
+                        "status": node.status.value,
+                        "detail": (
+                            "attempt was suspended or closed; the task needs a new attempt "
+                            "before it can progress"
+                        ),
+                    }
+                )
 
         payload = {
             "healthy": not problems,

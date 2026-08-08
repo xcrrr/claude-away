@@ -469,7 +469,18 @@ def start_attempt(
     record of who was running it.
     """
     operation = "start_attempt"
-    payload = {"task_id": task_id, "owner_id": owner_id, "mode": mode}
+    # Every field that affects what the attempt *is* belongs in the fingerprint. Omitting
+    # base_commit or branch would let a materially different request replay as though it
+    # were the same one -- silently returning an attempt against the wrong revision, which
+    # is exactly the "silently picking one" the idempotency contract promises not to do.
+    payload = {
+        "task_id": task_id,
+        "owner_id": owner_id,
+        "mode": mode,
+        "base_commit": base_commit,
+        "branch": branch,
+        "max_attempts": max_attempts,
+    }
 
     with db._status_transition() as con:
         recorded = _check_idempotency(con, idempotency_key, operation, payload)

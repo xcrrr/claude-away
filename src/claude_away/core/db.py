@@ -78,11 +78,20 @@ EXPECTED_TRIGGERS: frozenset[str] = frozenset(
 )
 """The guard triggers that must exist for the state database to be trustworthy.
 
+Two limits are worth stating plainly rather than implying a guarantee we do not have.
+
 Anyone with write access to the file can ``DROP TRIGGER``. SQLite offers no way to prevent
-that, and pretending otherwise would be worse than admitting it. What we *can* do is
-detect it: :func:`Database.missing_triggers` reports any that have gone missing, and
-``awayctl doctor`` refuses to call the state healthy when they have. Detection, not
-prevention.
+that. :func:`Database.missing_triggers` reports any that have vanished and ``awayctl
+doctor`` refuses to call such a state healthy -- detection, not prevention.
+
+Second, ``PRAGMA recursive_triggers`` is *per connection* and defaults to OFF. This class
+sets it, so ``INSERT OR REPLACE`` through a :class:`Database` fires the DELETE guards. A
+foreign connection -- the ``sqlite3`` CLI, an ad-hoc script -- does not, and REPLACE there
+can still overwrite an append-only row. So "append-only" holds against every path inside
+this package and against ordinary external ``UPDATE``/``DELETE``, but not against a
+deliberate external REPLACE. The mitigation is the same architectural one: the state
+database lives outside every enrolled repository, mode ``0600``, and its path is never put
+in an agent's prompt or environment.
 """
 
 
@@ -385,6 +394,10 @@ BEGIN
     SELECT RAISE(ROLLBACK, 'attempt_is_terminal');
 END;
 
+-- Identity and origin are fixed the moment the attempt is opened. Fields that later
+-- milestones legitimately fill in during execution -- branch, worktree_path, session_id,
+-- workflow_id -- are deliberately NOT listed: freezing them here would block Milestone 3
+-- from recording the Claude session that ran the attempt.
 CREATE TRIGGER attempts_identity_immutable
 BEFORE UPDATE ON attempts
 FOR EACH ROW WHEN
@@ -393,6 +406,8 @@ FOR EACH ROW WHEN
     OR NEW.attempt_number <> OLD.attempt_number
     OR NEW.runner_id      <> OLD.runner_id
     OR NEW.started_at     <> OLD.started_at
+    OR NEW.mode           <> OLD.mode
+    OR IFNULL(NEW.base_commit, '') <> IFNULL(OLD.base_commit, '')
 BEGIN
     SELECT RAISE(ROLLBACK, 'attempt_identity_is_immutable');
 END;
