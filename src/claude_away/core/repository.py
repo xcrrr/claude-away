@@ -23,7 +23,10 @@ from claude_away.core.models import (
     VerificationRequirement,
     VerificationType,
 )
-from claude_away.core.validation import validate_task_document
+from claude_away.core.validation import (
+    validate_task_document,
+    validate_verification_contract,
+)
 from claude_away.errors import NotFoundError, TaskLeasedError, ValidationError
 
 __all__ = [
@@ -292,6 +295,12 @@ def update_verification_requirements(
         raise ValidationError(
             "overriding the weakening guard requires a justification", task_id=task_id
         )
+
+    # The same contract rules creation enforces. A replan that could install an
+    # all-optional or review-only contract would hand back exactly the free DONE that
+    # creation refuses -- and allow_weakening must NOT waive this, because it exists to
+    # permit retiring a proven check, not to remove the deterministic floor entirely.
+    validate_verification_contract(requirements, task_id=task_id)
 
     with db.transaction() as con:
         existing = {

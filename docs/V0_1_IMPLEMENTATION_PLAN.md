@@ -47,6 +47,11 @@ Milestone 1 *models and enforces* the verification contract; Milestone 3 execute
 | An expired lease is not permission to rerun | Expiry does not release; takeover requires explicit reconciliation with a recorded reason |
 | A replan cannot silently weaken a failing check | Weakening guard in `update_verification_requirements` |
 | Replaying an operation after a crash does not duplicate it | Idempotency keys with request fingerprints |
+| Evidence must name the attempt that produced it | Refused at record time *and* by a database CHECK |
+| No live attempt means the gate is closed | `GateReason.NO_ACTIVE_ATTEMPT`; `mark_verified` requires an active attempt |
+| A replan cannot install a contract creation would reject | Shared `validate_verification_contract` on both paths |
+| `INSERT OR REPLACE` cannot resurrect a retired task | `PRAGMA recursive_triggers = ON`, so DELETE triggers fire during REPLACE |
+| A replay must still describe reality | `StaleReplayError` when the task or attempt moved on |
 
 ### Key design decisions
 
@@ -155,6 +160,30 @@ Recorded rather than silently patched, per CONTRIBUTING's instruction to flag mi
 | 12 | `PRODUCT_SPEC` forbids a replan from "silently weakening acceptance criteria", but criteria were bare strings with no identity to compare. | Acceptance criteria carry stable ids, and `update_verification_requirements` refuses to drop, demote or rewrite a required check whose evidence is absent or failing. |
 | 13 | `PRODUCT_SPEC` hedges "verification ... **where applicable**" and "human-required flag **when relevant**", while `STATE_MODEL` and the schema require both unconditionally. | Schema and `STATE_MODEL` are right -- an optional verification spec is a `DONE` with no gate. Left as a documentation nit rather than changing product text in this PR. |
 | 14 | `PRODUCT_SPEC` describes per-repo test/build recipes and safety overrides as current behaviour; `ROADMAP` puts them at v0.2 and no schema models them. | Not added. Fields that nothing validates are how schemas rot; the recipes arrive with the milestone that consumes them. |
+
+## Bypasses found by adversarial review, and closed
+
+Five holes were demonstrated working against an earlier revision of this milestone. Each
+now has a regression test in `tests/integration/test_gate_bypass_regressions.py`.
+
+1. **Evidence with a NULL `attempt_id` satisfied the gate** (critical). The gate matches
+   `attempt_id IS ?`; evaluated with `None` it matched unattributed rows, and
+   `record_evidence` defaulted that parameter to `None`. Reachable through the *documented*
+   rate-limit path, which suspends the attempt while leaving the task in `VERIFYING`: one
+   unattributed "pass" completed a task whose required check had never run.
+   `GateReason.NO_ACTIVE_ATTEMPT` had been declared and never wired. Closed at three layers
+   -- record-time validation, a database CHECK, and the gate itself.
+2. **The replan path could install an LLM-review-only contract** (high). Creation refused
+   it; `update_verification_requirements` never re-ran the invariant. Both paths now share
+   `validate_verification_contract`, and `allow_weakening` does not waive it.
+3. **`INSERT OR REPLACE` resurrected retired tasks** (medium). REPLACE deletes the old row
+   without firing DELETE triggers unless `recursive_triggers` is on, so it walked past both
+   `tasks_are_never_deleted` and the absorbing-status guards.
+4. **A stale idempotent replay reported success for failed work** (medium). Replaying
+   `start_attempt` returned a cheerful `READY -> RUNNING` for a task that had since become
+   `FAILED`. Now raises `StaleReplayError`.
+5. **`status_transition()` looked like public API** (low). It opens the database gate and
+   validates nothing; every guard lives above it. Renamed to `_status_transition`.
 
 ## Known limitations, stated plainly
 

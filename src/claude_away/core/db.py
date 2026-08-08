@@ -277,7 +277,11 @@ CREATE TABLE evidence (
                                           OR required_at_run IN (0,1)),
     -- Evidence aimed at a specific requirement must carry the hash of the requirement
     -- definition it was produced against; otherwise the gate cannot detect staleness.
-    CHECK (verification_id IS NULL OR requirement_spec_hash IS NOT NULL)
+    CHECK (verification_id IS NULL OR requirement_spec_hash IS NOT NULL),
+    -- ...and must name the attempt that produced it. Unattributed evidence was a hole:
+    -- the gate matches `attempt_id IS ?`, so a NULL-attempt row satisfied a gate evaluated
+    -- with no live attempt -- reachable through the documented rate-limit suspend path.
+    CHECK (verification_id IS NULL OR attempt_id IS NOT NULL)
 ) STRICT;
 
 CREATE INDEX evidence_task_idx    ON evidence(task_id);
@@ -505,6 +509,10 @@ class Database:
             deterministic=False,
         )
         con.execute("PRAGMA foreign_keys = ON")
+        # Without this, INSERT OR REPLACE resolves its conflict by deleting the old row
+        # *without firing DELETE triggers*, which let a REPLACE resurrect a CANCELLED task
+        # as PENDING straight past tasks_are_never_deleted. Verified against SQLite 3.45.
+        con.execute("PRAGMA recursive_triggers = ON")
         con.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
         # NORMAL is the right durability point under WAL: it survives process crashes
         # (our actual threat model) and only risks the very last commit on host power
@@ -576,11 +584,14 @@ class Database:
             self._transition_gate_open = previous
 
     @contextmanager
-    def status_transition(self) -> Iterator[sqlite3.Connection]:
+    def _status_transition(self) -> Iterator[sqlite3.Connection]:
         """A transaction in which task status may be changed.
 
-        Deliberately the only route to a status update. Callers outside
-        :mod:`claude_away.core.state` should never need this.
+        Private: the underscore is the point. This is the only route to a status update,
+        and it performs no validation of its own -- it merely opens the database gate. All
+        guard logic lives in :func:`claude_away.core.state._transition`, so a caller that
+        reached for this directly would bypass the transition table, the lease check and
+        the evidence gate while still producing a legal-looking write.
         """
         with self.transaction() as con, self._open_transition_gate():
             yield con

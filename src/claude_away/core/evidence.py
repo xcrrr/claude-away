@@ -210,6 +210,17 @@ def record_evidence(
     if not summary:
         raise ValidationError("evidence summary must not be empty", task_id=task_id)
 
+    if verification_id is not None and attempt_id is None:
+        # Unattributed evidence cannot be judged: the gate is attempt-scoped, so a row with
+        # no attempt would only ever match a gate evaluated with no attempt -- which is
+        # exactly the state a suspended run leaves behind. Refuse it at the source; a
+        # database CHECK enforces the same rule one layer down.
+        raise ValidationError(
+            "evidence for a verification requirement must name the attempt that produced it",
+            task_id=task_id,
+            verification_id=verification_id,
+        )
+
     created_at = to_iso(db.clock.now())
     truncated = (
         summary
@@ -388,6 +399,25 @@ def evaluate_gate(
     requirements = load_requirements(db, task_id)
     required = [r for r in requirements if r.required]
     optional = [r for r in requirements if not r.required]
+
+    if attempt_id is None:
+        # No live attempt means nothing produced evidence *for this run*, so there is
+        # nothing to be satisfied by. Falling through would compare against rows whose
+        # attempt_id is NULL and open the gate on evidence tied to no execution at all --
+        # reachable through the documented rate-limit suspend path, which closes the
+        # attempt while leaving the task in VERIFYING.
+        return GateReport(
+            task_id=task_id,
+            attempt_id=None,
+            satisfied=False,
+            reason=GateReason.NO_ACTIVE_ATTEMPT,
+            required_total=len(required),
+            missing=tuple(sorted(r.id for r in required)),
+            failed=(),
+            stale=(),
+            satisfied_ids=(),
+            optional_failed=(),
+        )
 
     missing: list[str] = []
     failed: list[str] = []

@@ -42,6 +42,7 @@ __all__ = [
     "validate_task_collection",
     "validate_task_document",
     "validate_task_proposal",
+    "validate_verification_contract",
 ]
 
 DETERMINISTIC_VERIFICATION_TYPES: frozenset[VerificationType] = frozenset(
@@ -150,6 +151,35 @@ def validate_task_proposal(document: Mapping[str, Any]) -> None:
     _validate_single_task_invariants(document)
 
 
+def validate_verification_contract(
+    verification: Sequence[Mapping[str, Any]], *, task_id: str = "<task>"
+) -> None:
+    """Enforce the rules a task's verification contract must satisfy at all times.
+
+    Extracted so that *every* path which writes a contract runs it -- creation and replan
+    alike. Checking only at creation left the replan path able to install a contract that
+    creation itself would have refused.
+    """
+    required = [r for r in verification if bool(r.get("required"))]
+    if not required:
+        raise ValidationError(
+            "task declares no required verification; DONE would be unreachable and, worse, "
+            "a naive gate would treat it as trivially satisfied",
+            task_id=task_id,
+        )
+    deterministic = [
+        r
+        for r in required
+        if VerificationType(str(r.get("type"))) in DETERMINISTIC_VERIFICATION_TYPES
+    ]
+    if not deterministic:
+        raise ValidationError(
+            "every required verification is of type 'review'; an LLM opinion may "
+            "supplement a deterministic check but may not be the only thing gating DONE",
+            task_id=task_id,
+        )
+
+
 def _validate_single_task_invariants(document: Mapping[str, Any]) -> None:
     task_id = str(document.get("id", "<new>"))
 
@@ -186,24 +216,7 @@ def _validate_single_task_invariants(document: Mapping[str, Any]) -> None:
         )
 
     # -- at least one required, deterministic check ------------------------------------
-    required = [r for r in verification if bool(r.get("required"))]
-    if not required:
-        raise ValidationError(
-            "task declares no required verification; DONE would be unreachable and, worse, "
-            "a naive gate would treat it as trivially satisfied",
-            task_id=task_id,
-        )
-    deterministic = [
-        r
-        for r in required
-        if VerificationType(str(r.get("type"))) in DETERMINISTIC_VERIFICATION_TYPES
-    ]
-    if not deterministic:
-        raise ValidationError(
-            "every required verification is of type 'review'; an LLM opinion may "
-            "supplement a deterministic check but may not be the only thing gating DONE",
-            task_id=task_id,
-        )
+    validate_verification_contract(verification, task_id=task_id)
 
     # -- self dependency ---------------------------------------------------------------
     dependencies: Sequence[str] = document.get("dependencies", [])

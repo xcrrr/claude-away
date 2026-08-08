@@ -134,7 +134,7 @@ class TestIllegalTransitions:
         drive_to_done(seeded)
         with (
             pytest.raises(sqlite3.IntegrityError, match="done_is_absorbing"),
-            seeded.status_transition() as con,
+            seeded._status_transition() as con,
         ):
             con.execute("UPDATE tasks SET status = 'READY' WHERE id = 'AWAY-0001'")
         assert load_task(seeded, "AWAY-0001").status is TaskStatus.DONE
@@ -144,7 +144,7 @@ class TestIllegalTransitions:
         state.cancel_task(seeded, "AWAY-0001", reason="not needed")
         with (
             pytest.raises(sqlite3.IntegrityError, match="cancelled_is_absorbing"),
-            seeded.status_transition() as con,
+            seeded._status_transition() as con,
         ):
             con.execute("UPDATE tasks SET status = 'PENDING' WHERE id = 'AWAY-0001'")
         assert load_task(seeded, "AWAY-0001").status is TaskStatus.CANCELLED

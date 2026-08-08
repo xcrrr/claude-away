@@ -45,6 +45,7 @@ from claude_away.errors import (
     InvalidStateError,
     LeaseNotHeldError,
     NotFoundError,
+    StaleReplayError,
 )
 
 __all__ = [
@@ -132,7 +133,53 @@ def _check_idempotency(
     return loads(str(row["result"]))
 
 
-def _replay_result(task_id: str, recorded: Mapping[str, Any]) -> TransitionResult:
+def _replay_result(
+    con: Any,
+    task_id: str,
+    recorded: Mapping[str, Any],
+    *,
+    key: str,
+    operation: str,
+    require_active_attempt: bool,
+) -> TransitionResult:
+    """Return a recorded outcome, but only if it still describes reality.
+
+    A replay answers "did my earlier call land?", not "pretend it is still true". Between
+    the original call and the replay the world can have moved on -- the task may have been
+    failed or cancelled, the attempt closed, the lease lost. Handing back a cheerful
+    ``READY -> RUNNING`` for a task that is now ``FAILED`` would tell a recovering
+    supervisor it owns work that it does not.
+
+    ``require_active_attempt`` distinguishes the two shapes: ``start_attempt`` promises a
+    live attempt, so a closed one invalidates the replay, whereas ``mark_verified``
+    deliberately closes the attempt it reports.
+    """
+    recorded_status = TaskStatus(str(recorded["to_status"]))
+    current_status = _load_status(con, task_id)
+    if current_status is not recorded_status:
+        raise StaleReplayError(
+            "recorded result no longer describes the task's current state",
+            key=key,
+            operation=operation,
+            task_id=task_id,
+            recorded_status=recorded_status.value,
+            current_status=current_status.value,
+        )
+
+    attempt_id = recorded.get("attempt_id")
+    if require_active_attempt and attempt_id is not None:
+        still_active = con.execute(
+            "SELECT 1 FROM attempts WHERE id = ? AND outcome IS NULL", (attempt_id,)
+        ).fetchone()
+        if still_active is None:
+            raise StaleReplayError(
+                "the attempt this result refers to is no longer active",
+                key=key,
+                operation=operation,
+                task_id=task_id,
+                attempt_id=str(attempt_id),
+            )
+
     return TransitionResult(
         task_id=task_id,
         from_status=TaskStatus(str(recorded["from_status"])),
@@ -268,7 +315,7 @@ def refresh_readiness(db: Database, *, actor: str = "system") -> list[str]:
     after any terminal event, and safe to call again after a crash.
     """
     promoted: list[str] = []
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         for task_id in compute_ready(task_nodes(db)):
             _transition(
                 db,
@@ -424,10 +471,17 @@ def start_attempt(
     operation = "start_attempt"
     payload = {"task_id": task_id, "owner_id": owner_id, "mode": mode}
 
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         recorded = _check_idempotency(con, idempotency_key, operation, payload)
         if recorded is not None:
-            return _replay_result(task_id, recorded)
+            return _replay_result(
+                con,
+                task_id,
+                recorded,
+                key=str(idempotency_key),
+                operation=operation,
+                require_active_attempt=True,
+            )
 
         _require_lease(db, con, task_id, owner_id)
 
@@ -469,7 +523,7 @@ def start_attempt(
 
 def begin_verification(db: Database, task_id: str, *, owner_id: str) -> TransitionResult:
     """``RUNNING -> VERIFYING``. The attempt stays open; verification belongs to it."""
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         _require_lease(db, con, task_id, owner_id)
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
@@ -507,16 +561,29 @@ def mark_verified(
     operation = "mark_verified"
     payload = {"task_id": task_id, "owner_id": owner_id}
 
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         recorded = _check_idempotency(con, idempotency_key, operation, payload)
         if recorded is not None:
-            return _replay_result(task_id, recorded)
+            return _replay_result(
+                con,
+                task_id,
+                recorded,
+                key=str(idempotency_key),
+                operation=operation,
+                require_active_attempt=False,
+            )
 
         _require_lease(db, con, task_id, owner_id)
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
         ).fetchone()
-        attempt_id = None if row is None else str(row["id"])
+        if row is None:
+            raise InvalidStateError(
+                "cannot complete a task with no active attempt; a suspended or closed "
+                "attempt means nothing produced evidence for this run",
+                task_id=task_id,
+            )
+        attempt_id = str(row["id"])
 
         report: GateReport = evaluate_gate(db, task_id, attempt_id=attempt_id)
         if not report.satisfied:
@@ -564,7 +631,7 @@ def request_retry(
     README's "bounded retries, then BLOCKED or FAILED rather than infinite loops" is
     actually delivered.
     """
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         _require_lease(db, con, task_id, owner_id)
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
@@ -662,7 +729,7 @@ def mark_blocked(
     """
     if not reason:
         raise ValueError("blocking a task requires a reason")
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
         ).fetchone()
@@ -690,7 +757,7 @@ def resolve_blocker(
     may have been cancelled or reopened, and promoting straight to ``READY`` would let a
     task run before its prerequisites.
     """
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         current = _load_status(con, task_id)
         if current is not TaskStatus.BLOCKED:
             raise IllegalTransitionError(
@@ -717,7 +784,7 @@ def fail_task(
 ) -> TransitionResult:
     if not reason:
         raise ValueError("failing a task requires a reason")
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
         ).fetchone()
@@ -747,7 +814,7 @@ def cancel_task(
     """
     if not reason:
         raise ValueError("cancelling a task requires a reason")
-    with db.status_transition() as con:
+    with db._status_transition() as con:
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)
         ).fetchone()

@@ -359,6 +359,18 @@ class ReconciliationRequiredError(ClaudeAwayError):
 # --------------------------------------------------------------------------------------
 
 
+class StaleReplayError(ClaudeAwayError):
+    """A recorded idempotent result no longer describes reality.
+
+    Distinct from :class:`IdempotencyConflictError`, which means "you reused a key for
+    different content". This one means "your key is right, but the world moved on since" --
+    the task was failed or cancelled, or the attempt was closed. A recovering supervisor
+    must re-read state rather than trust the old answer, and those are different responses.
+    """
+
+    code = "stale_replay"
+
+
 class IdempotencyConflictError(ClaudeAwayError):
     """An idempotency key was reused with a materially different request.
 
