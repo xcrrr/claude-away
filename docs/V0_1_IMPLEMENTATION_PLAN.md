@@ -216,6 +216,23 @@ A third pass found four more, all fixed:
 14. **`awayctl doctor` reported the supported rate-limit suspend path as corruption**
     (medium). It is now reported as `task_awaiting_resume`, which is what it is.
 
+A fourth pass found four more, all fixed:
+
+15. **`transaction()` partially committed after a swallowed guard abort, and reported the
+    opposite** (high). Once `RAISE(ROLLBACK)` ends SQLite's transaction, every later
+    statement in the block runs in autocommit and lands individually -- while the error
+    said all writes were discarded. A nested block now re-opens a transaction the moment it
+    detects the abort, so the rest of the block stays under control and is discarded with it.
+16. **`migrate()` released the write lock before the migration loop** (medium), leaving the
+    concurrent-first-open race it was meant to close.
+17. **A silent WAL fallback kept `synchronous=NORMAL`** (medium), which SQLite documents as
+    corruption-prone with a rollback journal. Durability now follows the journal mode that
+    was actually granted.
+18. **The weakening guard called a proven requirement unproven once its attempt closed**
+    (medium), blocking legitimate replanning. The gate is attempt-scoped because it asks
+    "is this run finished?"; the guard asks "was this criterion ever met?", which is not the
+    same question.
+
 ## Known limitations, stated plainly
 
 * **A process with write access to the state file can drop the guard triggers.** SQLite

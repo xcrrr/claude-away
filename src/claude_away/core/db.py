@@ -497,6 +497,7 @@ class Database:
         self.clock: Clock = clock or SystemClock()
         self._busy_timeout_ms = busy_timeout_ms
         self._transition_gate_open = False
+        self._guard_aborted = False
         self._depth = 0
         self._closed = False
 
@@ -530,10 +531,7 @@ class Database:
         # as PENDING straight past tasks_are_never_deleted. Verified against SQLite 3.45.
         con.execute("PRAGMA recursive_triggers = ON")
         con.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
-        # NORMAL is the right durability point under WAL: it survives process crashes
-        # (our actual threat model) and only risks the very last commit on host power
-        # loss, in exchange for a large write-throughput gain.
-        con.execute("PRAGMA synchronous = NORMAL")
+        journal_mode = "memory"
         if str(self.path) != ":memory:":
             # WAL is unavailable on some network filesystems and can fail if another
             # process holds the database. It buys read availability, not correctness --
@@ -541,6 +539,17 @@ class Database:
             # degrading to the rollback journal is far better than refusing to open.
             with suppress(sqlite3.OperationalError):
                 con.execute("PRAGMA journal_mode = WAL")
+            row = con.execute("PRAGMA journal_mode").fetchone()
+            journal_mode = str(row[0]).lower() if row else "delete"
+
+        # synchronous=NORMAL is the right durability point *under WAL*: it survives process
+        # crashes (our actual threat model) and risks only the last commit on host power
+        # loss. SQLite documents the same setting as corruption-prone with a rollback
+        # journal, so if the WAL request did not take, do not quietly keep the relaxed
+        # setting that only WAL made safe.
+        con.execute(
+            "PRAGMA synchronous = NORMAL" if journal_mode == "wal" else "PRAGMA synchronous = FULL"
+        )
 
     def _transition_guard(self) -> int:
         return 1 if self._transition_gate_open else 0
@@ -565,6 +574,17 @@ class Database:
             self._depth += 1
             try:
                 yield self._connection
+            except BaseException:
+                # A guard raised RAISE(ROLLBACK) inside this nested block, which ends the
+                # transaction in SQLite. If we did nothing, every later statement in the
+                # enclosing block would run in autocommit and land individually -- so a
+                # caller that swallowed this error would silently persist half its work.
+                # Re-opening a transaction puts the rest of the block back under control,
+                # and the poison flag guarantees the outer scope discards it.
+                if not self._connection.in_transaction:
+                    self._guard_aborted = True
+                    self._connection.execute("BEGIN IMMEDIATE")
+                raise
             finally:
                 self._depth -= 1
             return
@@ -576,6 +596,7 @@ class Database:
             yield con
         except BaseException:
             self._depth = 0
+            self._guard_aborted = False
             # The immutability and transition guards raise RAISE(ROLLBACK), which ends the
             # transaction inside SQLite before the exception reaches us. Issuing another
             # ROLLBACK would fail with "cannot rollback - no transaction is active" and
@@ -585,14 +606,17 @@ class Database:
             raise
         else:
             self._depth = 0
-            if not con.in_transaction:
-                # A guard trigger raised RAISE(ROLLBACK) somewhere inside, and the caller
-                # swallowed the exception. SQLite has already discarded everything; a plain
-                # COMMIT here would fail with "cannot commit - no transaction is active"
-                # and hide the fact that writes were lost. Say so explicitly instead.
+            aborted = self._guard_aborted
+            self._guard_aborted = False
+            if aborted or not con.in_transaction:
+                # A guard fired somewhere inside and the caller swallowed the exception.
+                # Everything is discarded -- either by SQLite's own rollback, or by ours
+                # over the transaction re-opened when we detected the abort.
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
                 raise DatabaseError(
-                    "transaction was rolled back by a database guard before commit; "
-                    "all writes in this block were discarded",
+                    "transaction was aborted by a database guard; all writes in this "
+                    "block were discarded",
                     path=str(self.path),
                 )
             con.execute("COMMIT")

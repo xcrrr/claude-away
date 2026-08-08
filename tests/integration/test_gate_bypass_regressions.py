@@ -268,21 +268,28 @@ class TestNestedRollbackIsReported:
         state.refresh_readiness(seeded)  # ensure the events table has a row to delete
 
         with (
-            pytest.raises(DatabaseError, match="rolled back by a database guard"),
+            pytest.raises(DatabaseError, match="aborted by a database guard"),
             seeded.transaction() as con,
         ):
             con.execute(
                 "INSERT INTO projects(id, created_at) "
-                "VALUES ('web', '2026-01-01T00:00:00.000000+00:00')"
+                "VALUES ('before', '2026-01-01T00:00:00.000000+00:00')"
             )
             try:
                 with seeded.transaction() as inner:
                     inner.execute("DELETE FROM events")
             except sqlite3.IntegrityError:
                 pass  # a caller that swallows the guard error
+            # Writes issued *after* the abort are the subtle half: SQLite drops to
+            # autocommit once its transaction ends, so without re-opening one this would
+            # land individually while the error claimed everything had been discarded.
+            con.execute(
+                "INSERT INTO projects(id, created_at) "
+                "VALUES ('after', '2026-01-01T00:00:00.000000+00:00')"
+            )
 
-        # And the discarded write really is discarded, rather than half-committed.
-        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'web'") is None
+        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'before'") is None
+        assert seeded.query_one("SELECT 1 FROM projects WHERE id = 'after'") is None
 
 
 class TestContractFreezeIsCheckedUnderTheLock:
