@@ -23,7 +23,7 @@ autonomous supervisor be built on this without replacing it later?*
 the documented eight-state task lifecycle behind a single enforced transition layer; the
 evidence gate; DAG validation and readiness; attempts; append-only evidence and audit
 events; leases with expiry and reconciliation; idempotent replay; typed domain errors;
-schema contracts; 227 tests; CI.
+schema contracts; a test suite covering crash recovery, concurrency and replay; CI.
 
 **Not delivered, by design:** anything that executes. No Git operations, no Claude
 invocation, no verification command execution, no scheduler, no planner, no plugin skills.

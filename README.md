@@ -105,7 +105,7 @@ without crash recovery is not a release.
 - task graph validation — dependencies, cycles, readiness;
 - leases, so two runners can never work the same task at once;
 - append-only evidence and audit history;
-- 227 tests covering crash recovery, concurrency and replay.
+- over 200 tests covering crash recovery, concurrency and replay.
 
 **Not built yet** — everything that executes:
 

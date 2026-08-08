@@ -107,24 +107,40 @@ def _request_fingerprint(operation: str, payload: Mapping[str, Any]) -> str:
 
 
 def _check_idempotency(
-    db: Database, key: str | None, operation: str, payload: Mapping[str, Any]
+    con: Any, key: str | None, operation: str, payload: Mapping[str, Any]
 ) -> dict[str, Any] | None:
     """Return a previously recorded result for ``key``, or ``None`` to proceed.
 
     Replaying an identical call after a crash returns the original outcome. Reusing a key
     with *different* content is a caller bug and raises rather than silently picking one.
+
+    Takes a connection rather than the :class:`Database` so the lookup runs inside the same
+    transaction as the effect it guards. Checking first and writing afterwards would let two
+    concurrent replays of one key both pass the check; the second would then collide on the
+    primary key and surface a raw constraint error instead of the replay it asked for.
     """
     if key is None:
         return None
-    row = db.query_one(
+    row = con.execute(
         "SELECT operation, request_hash, result FROM idempotency_keys WHERE key = ?", (key,)
-    )
+    ).fetchone()
     if row is None:
         return None
     fingerprint = _request_fingerprint(operation, payload)
     if str(row["operation"]) != operation or str(row["request_hash"]) != fingerprint:
         raise IdempotencyConflictError(key=key, operation=operation)
     return loads(str(row["result"]))
+
+
+def _replay_result(task_id: str, recorded: Mapping[str, Any]) -> TransitionResult:
+    return TransitionResult(
+        task_id=task_id,
+        from_status=TaskStatus(str(recorded["from_status"])),
+        to_status=TaskStatus(str(recorded["to_status"])),
+        event_id=int(recorded["event_id"]),
+        attempt_id=recorded.get("attempt_id"),
+        replayed=True,
+    )
 
 
 def _store_idempotency(
@@ -407,18 +423,12 @@ def start_attempt(
     """
     operation = "start_attempt"
     payload = {"task_id": task_id, "owner_id": owner_id, "mode": mode}
-    replayed = _check_idempotency(db, idempotency_key, operation, payload)
-    if replayed is not None:
-        return TransitionResult(
-            task_id=task_id,
-            from_status=TaskStatus(str(replayed["from_status"])),
-            to_status=TaskStatus(str(replayed["to_status"])),
-            event_id=int(replayed["event_id"]),
-            attempt_id=replayed.get("attempt_id"),
-            replayed=True,
-        )
 
     with db.status_transition() as con:
+        recorded = _check_idempotency(con, idempotency_key, operation, payload)
+        if recorded is not None:
+            return _replay_result(task_id, recorded)
+
         _require_lease(db, con, task_id, owner_id)
 
         used = int(
@@ -496,18 +506,12 @@ def mark_verified(
     """
     operation = "mark_verified"
     payload = {"task_id": task_id, "owner_id": owner_id}
-    replayed = _check_idempotency(db, idempotency_key, operation, payload)
-    if replayed is not None:
-        return TransitionResult(
-            task_id=task_id,
-            from_status=TaskStatus(str(replayed["from_status"])),
-            to_status=TaskStatus(str(replayed["to_status"])),
-            event_id=int(replayed["event_id"]),
-            attempt_id=replayed.get("attempt_id"),
-            replayed=True,
-        )
 
     with db.status_transition() as con:
+        recorded = _check_idempotency(con, idempotency_key, operation, payload)
+        if recorded is not None:
+            return _replay_result(task_id, recorded)
+
         _require_lease(db, con, task_id, owner_id)
         row = con.execute(
             "SELECT id FROM attempts WHERE task_id = ? AND outcome IS NULL", (task_id,)

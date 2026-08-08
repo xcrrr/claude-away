@@ -210,53 +210,6 @@ def record_evidence(
     if not summary:
         raise ValidationError("evidence summary must not be empty", task_id=task_id)
 
-    exists = db.query_one("SELECT 1 FROM tasks WHERE id = ?", (task_id,))
-    if exists is None:
-        raise NotFoundError("task", task_id)
-
-    spec_hash: str | None = None
-    required_at_run: int | None = None
-    if verification_id is not None:
-        row = db.query_one(
-            "SELECT spec_hash, required FROM verification_requirements "
-            "WHERE task_id = ? AND verification_id = ?",
-            (task_id, verification_id),
-        )
-        if row is None:
-            raise NotFoundError("verification requirement", f"{task_id}/{verification_id}")
-        spec_hash = str(row["spec_hash"])
-        required_at_run = int(row["required"])
-
-        # Bound re-runs of the same requirement within one attempt. Counting the current
-        # spec_hash only means that legitimately *changing* a check resets the budget,
-        # while hammering an unchanged flaky check does not.
-        used = db.query_one(
-            "SELECT COUNT(*) AS n FROM evidence "
-            " WHERE task_id = ? AND verification_id = ? AND requirement_spec_hash = ? "
-            "   AND attempt_id IS ?",
-            (task_id, verification_id, spec_hash, attempt_id),
-        )
-        if used is not None and int(used["n"]) >= MAX_RUNS_PER_REQUIREMENT_PER_ATTEMPT:
-            raise ValidationError(
-                "verification run budget exhausted for this requirement in this attempt",
-                task_id=task_id,
-                verification_id=verification_id,
-                attempt_id=attempt_id,
-                budget=MAX_RUNS_PER_REQUIREMENT_PER_ATTEMPT,
-            )
-
-    if attempt_id is not None:
-        attempt = db.query_one("SELECT task_id FROM attempts WHERE id = ?", (attempt_id,))
-        if attempt is None:
-            raise NotFoundError("attempt", attempt_id)
-        if str(attempt["task_id"]) != task_id:
-            raise ValidationError(
-                "attempt belongs to a different task",
-                attempt_id=attempt_id,
-                attempt_task_id=str(attempt["task_id"]),
-                task_id=task_id,
-            )
-
     created_at = to_iso(db.clock.now())
     truncated = (
         summary
@@ -264,7 +217,60 @@ def record_evidence(
         else (summary[: _MAX_SUMMARY_CHARS - 3] + "...")
     )
 
+    spec_hash: str | None = None
+    required_at_run: int | None = None
+
+    # Every check below is a read that the following write depends on, so all of it lives
+    # in one BEGIN IMMEDIATE transaction. Validating first and inserting afterwards would
+    # let two concurrent recorders both observe "budget not yet spent" and then both write,
+    # which is precisely the re-run-until-green laundering the budget exists to stop.
     with db.transaction() as con:
+        if con.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            raise NotFoundError("task", task_id)
+
+        if verification_id is not None:
+            row = con.execute(
+                "SELECT spec_hash, required FROM verification_requirements "
+                "WHERE task_id = ? AND verification_id = ?",
+                (task_id, verification_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("verification requirement", f"{task_id}/{verification_id}")
+            spec_hash = str(row["spec_hash"])
+            required_at_run = int(row["required"])
+
+            # Bound re-runs of the same requirement within one attempt. Counting the
+            # current spec_hash only means that legitimately *changing* a check resets the
+            # budget, while hammering an unchanged flaky check does not.
+            used = con.execute(
+                "SELECT COUNT(*) AS n FROM evidence "
+                " WHERE task_id = ? AND verification_id = ? AND requirement_spec_hash = ? "
+                "   AND attempt_id IS ?",
+                (task_id, verification_id, spec_hash, attempt_id),
+            ).fetchone()
+            if used is not None and int(used["n"]) >= MAX_RUNS_PER_REQUIREMENT_PER_ATTEMPT:
+                raise ValidationError(
+                    "verification run budget exhausted for this requirement in this attempt",
+                    task_id=task_id,
+                    verification_id=verification_id,
+                    attempt_id=attempt_id,
+                    budget=MAX_RUNS_PER_REQUIREMENT_PER_ATTEMPT,
+                )
+
+        if attempt_id is not None:
+            attempt = con.execute(
+                "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise NotFoundError("attempt", attempt_id)
+            if str(attempt["task_id"]) != task_id:
+                raise ValidationError(
+                    "attempt belongs to a different task",
+                    attempt_id=attempt_id,
+                    attempt_task_id=str(attempt["task_id"]),
+                    task_id=task_id,
+                )
+
         cursor = con.execute(
             "INSERT INTO evidence("
             "  task_id, attempt_id, verification_id, requirement_spec_hash,"
