@@ -212,7 +212,17 @@ class Enrolment:
                 enrolled=[str(r.root) for r in self.repositories],
             )
 
-        for store in (best.git_dir, best.common_dir):
+        # Every enrolled repository's stores, not just `best`'s. A git directory that is
+        # neither named `.git` nor belongs to the longest match was authorised:
+        # `git init --separate-git-dir=<root>/store` puts a live git directory at
+        # `<root>/store`, and with two enrolled repositories one project's store can sit
+        # inside another's tree. The `.git`-component fallback only catches the literal name.
+        stores = [
+            store
+            for repository in self.repositories
+            for store in (repository.git_dir, repository.common_dir)
+        ]
+        for store in stores:
             if candidate == store or candidate.is_relative_to(store):
                 raise NotEnrolledError(
                     "paths inside the git directory are never authorised; its config names "
@@ -222,6 +232,30 @@ class Enrolment:
                     project_id=best.project_id,
                     git_dir=str(store),
                 )
+
+        # A git directory need not be called `.git`. `git init --separate-git-dir=<root>/store`
+        # puts a live one at an arbitrary name, and it may belong to a nested repository that
+        # is not enrolled at all, so neither the enrolled-store list above nor the `.git`
+        # name test below sees it. Detect the directory by its contents instead: a git dir
+        # always holds HEAD, objects/ and refs/. Filesystem probing only -- no Git invoked,
+        # so nothing here can execute repository-chosen configuration.
+        probe = candidate if candidate.is_dir() else candidate.parent
+        while probe == best.root or probe.is_relative_to(best.root):
+            if (
+                (probe / "HEAD").is_file()
+                and (probe / "objects").is_dir()
+                and (probe / "refs").is_dir()
+            ):
+                raise NotEnrolledError(
+                    "paths inside a git directory are never authorised; this one is not "
+                    "named .git but has a git directory's contents",
+                    path=str(candidate),
+                    project_id=best.project_id,
+                    git_dir=str(probe),
+                )
+            if probe == best.root:
+                break
+            probe = probe.parent
 
         relative = candidate.relative_to(best.root)
         if ".git" in relative.parts:

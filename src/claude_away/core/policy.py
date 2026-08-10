@@ -160,18 +160,26 @@ def normalise_repo_path(path: str) -> PurePosixPath:
     treats anything it cannot normalise as protected, so the failure direction is closed.
     """
     cleaned = path.replace("\\", "/").strip()
+    # `./` stripping runs BEFORE the absoluteness test, not after. It used to run after, so
+    # `.//infra` survived the check, lost its `./`, and returned as `/infra` -- an absolute
+    # PurePosixPath, exactly what the docstring promises never to return, and returned
+    # silently so `is_path_protected`'s fail-closed `except ValueError` never fired.
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
     # A drive letter is absolute too. Backslashes fold before this check, so `C:\repo\x`
     # arrives as `C:/repo/x`, which does not start with "/" and was therefore accepted as a
     # relative path called `C:` -- sharing no component with any protected entry, and so
     # silently unprotected. That is the fail-open the POSIX branch exists to avoid.
+    # Guarded on a *drive* letter only: a single-letter first component is a legal relative
+    # path (`c/src/app.py`), so the colon is what makes it a drive.
     if cleaned.startswith("/") or (len(cleaned) > 1 and cleaned[1] == ":" and cleaned[0].isalpha()):
         raise ValueError(
             f"path must be repository-relative, not absolute: {path!r}; relativise it "
             "against the repository root before asking whether it is protected"
         )
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
     candidate = PurePosixPath(cleaned)
+    if candidate.is_absolute():  # pragma: no cover - belt and braces after the checks above
+        raise ValueError(f"path must be repository-relative, not absolute: {path!r}")
     if any(part == ".." for part in candidate.parts):
         raise ValueError(f"repository-relative path must not contain '..': {path!r}")
     return candidate

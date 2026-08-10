@@ -515,3 +515,24 @@ class TestWindowsAbsolutePathsFailClosed:
     def test_an_ordinary_path_beginning_with_a_letter_is_unaffected(self) -> None:
         assert str(normalise_repo_path("c/src/app.py")) == "c/src/app.py"
         assert str(normalise_repo_path("app/[slug]/page.tsx")) == "app/[slug]/page.tsx"
+
+
+class TestNormalisationCannotReturnAnAbsolutePath:
+    """`./` stripping ran AFTER the absoluteness test, so `.//infra` returned `/infra`.
+
+    Absolute, silently, with no ValueError -- so `is_path_protected`'s fail-closed
+    `except ValueError: return True` never fired and the entry matched nothing.
+    """
+
+    @pytest.mark.parametrize("raw", [".//infra", ".//infra/deploy.tf", "././/x", ".//"])
+    def test_leading_dot_slash_cannot_produce_an_absolute_path(self, raw: str) -> None:
+        try:
+            result = normalise_repo_path(raw)
+        except ValueError:
+            return  # refusing is the other acceptable answer
+        assert not result.is_absolute(), f"{raw!r} normalised to absolute {result}"
+
+    def test_the_policy_still_matches_the_equivalent_relative_path(self) -> None:
+        policy = SafetyPolicy(allow_commit=True, protected_paths=("infra",))
+        assert policy.is_path_protected(".//infra/deploy.tf")
+        assert not policy.evaluate(Operation.COMMIT, paths=[".//infra/deploy.tf"]).allowed

@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -631,7 +631,14 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
     was written.
     """
     offenders = list(_repository_defined_command_config(runner))
-    gitlinks = _gitlink_paths(runner)
+    # Listed from the repository ROOT, not from `runner.cwd`. `git ls-files` reports only
+    # paths at or below the current directory, and reports them relative to it, while
+    # `git status` is repo-wide regardless of cwd. Inspecting a subdirectory therefore
+    # audited no submodules at all while Git still descended into every one of them.
+    root_runner = GitRunner(
+        runner.path("rev-parse", "--show-toplevel").resolve(), timeout=runner.timeout
+    )
+    gitlinks = _gitlink_paths(root_runner)
 
     if _depth >= _MAX_SUBMODULE_DEPTH:
         # The depth bound stops *us*, not Git. `git status --ignore-submodules=none`
@@ -651,7 +658,8 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
                 unaudited=list(gitlinks),
             )
     else:
-        root = runner.path("rev-parse", "--show-toplevel").resolve()
+        root = root_runner.cwd
+        own_git_dir = runner.path("rev-parse", "--absolute-git-dir").resolve()
         for relative in gitlinks:
             worktree = (root / relative).resolve()
             if not worktree.is_dir():
@@ -659,7 +667,18 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
 
             child = GitRunner(worktree, timeout=runner.timeout)
             try:
-                child_root = child.path("rev-parse", "--show-toplevel").resolve()
+                # `--absolute-git-dir`, NOT `--show-toplevel`. The skip below exists only to
+                # avoid re-auditing the superproject when a gitlinked path is not itself a
+                # repository (Git walks *up* from `-C`), and `--show-toplevel` was the wrong
+                # question to ask: it honours `core.worktree`, which lives in the submodule's
+                # own config -- untrusted scope by this module's own definition. So the
+                # repository could decide whether it got audited. Two lines in
+                # `.git/modules/<name>/config` pointed `--show-toplevel` at a decoy, the skip
+                # fired, the audit never read the config, and `git status` descended and ran
+                # the filter anyway: four executions and a dirty tree reported clean. The git
+                # directory is the identity that actually distinguishes "another repository"
+                # from "walked back up to this one", and `core.worktree` cannot move it.
+                child_git_dir = child.path("rev-parse", "--absolute-git-dir").resolve()
             except GitError as exc:
                 # Git could not say what this path is -- a corrupt submodule config does
                 # this. Skipping would be the wrong answer twice over: `git status` descends
@@ -673,12 +692,12 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
                     submodule=relative,
                     detail=exc.message,
                 ) from exc
-            if child_root != worktree:
-                # A gitlinked path that is not itself a repository root. Git walks *up* from
-                # `-C`, so without this check the child runner resolves back to the
-                # superproject and we audit it again -- once per level, to the depth cap --
-                # while learning nothing. `git status` has no separate config to read here
-                # either, because there is no repository at this path to read one from.
+            if child_git_dir == own_git_dir:
+                # The gitlinked path is not its own repository: Git walked up and handed us
+                # this repository again. There is no separate config to read, and recursing
+                # would re-audit the superproject once per level to the depth cap while
+                # learning nothing. Any *other* git directory is a real second repository
+                # whose config `git status` will read, so it is audited.
                 continue
 
             try:
@@ -738,6 +757,60 @@ def _unverifiable_paths(runner: GitRunner) -> tuple[str, ...]:
         if tag.islower() or tag == b"S":
             flagged.append(_decode(record[2:]))
     return tuple(flagged)
+
+
+def _submodule_dirtiness(runner: GitRunner, root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Walk submodules ourselves and report what their own status would hide.
+
+    Two masking routes made a dirty submodule report clean, and neither is visible from the
+    superproject's porcelain:
+
+    * ``git update-index --assume-unchanged`` inside a submodule silences that submodule's
+      child ``git status``, so nothing reaches the parent. ``unverifiable`` was read from the
+      superproject index only, so it stayed empty.
+    * ``submodule.<name>.ignore = all`` is honoured by the *child* status. It can live in the
+      submodule's own config or in ``.gitmodules`` -- tracked content, which is not a config
+      scope at all, so the command-key audit cannot see it and ``--ignore-submodules=none``
+      on the top-level call does not reach it.
+
+    Rather than trust the descent, each submodule is inspected directly with our own pinned
+    configuration and our own flags. Returns ``(unverifiable, dirty)``, both repository-
+    relative and prefixed with the submodule path.
+    """
+    unverifiable: list[str] = []
+    dirty: list[str] = []
+
+    for relative in _gitlink_paths(runner):
+        worktree = (root / relative).resolve()
+        if not worktree.is_dir():
+            continue
+        child = GitRunner(worktree, timeout=runner.timeout)
+        try:
+            if (
+                child.path("rev-parse", "--absolute-git-dir").resolve()
+                == runner.path("rev-parse", "--absolute-git-dir").resolve()
+            ):
+                continue  # walked back up to this repository; not a separate submodule
+            own = child.run(
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ).stdout
+            child_status = _parse_porcelain_v2(own, unverifiable=_unverifiable_paths(child))
+        except GitError:
+            # Unreadable submodule: the config audit refuses these before we get here, so
+            # reaching this point means something changed underneath us. Treat it as dirty
+            # rather than clean -- an unreadable subtree is not an inspected one.
+            dirty.append(relative)
+            continue
+
+        unverifiable.extend(f"{relative}/{entry}" for entry in child_status.unverifiable)
+        if not child_status.is_clean:
+            dirty.append(relative)
+
+    return tuple(unverifiable), tuple(dirty)
 
 
 def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
@@ -871,10 +944,23 @@ def inspect_repository(
                 path=str(path),
                 stderr=stderr[:_MAX_STDERR_CHARS],
             )
-        raise NotAGitRepositoryError(
-            "path is not inside a Git working tree",
-            path=str(path),
-            stderr=stderr[:_MAX_STDERR_CHARS],
+        # Only Git actually saying "not a repository" means that. Every other non-zero
+        # exit -- dubious ownership, a permission error, a broken `core.repositoryformat-
+        # version`, a corrupt config -- means we could not tell, and classifying those as
+        # "not a repository" is a fail-open that callers then trust: `awayctl init`'s
+        # location guard passes on NotAGitRepositoryError, so a repository able to make
+        # rev-parse fail could have the ledger created inside itself.
+        if "not a git repository" in stderr.lower():
+            raise NotAGitRepositoryError(
+                "path is not inside a Git working tree",
+                path=str(path),
+                stderr=stderr[:_MAX_STDERR_CHARS],
+            )
+        raise GitCommandError(
+            list(inside.args),
+            inside.returncode,
+            stderr[:_MAX_STDERR_CHARS],
+            cwd=str(path),
         )
     # Bare is checked *before* "not a working tree", because a bare repository answers
     # `false` to both questions and would otherwise get the vaguer of the two messages.
@@ -925,6 +1011,27 @@ def inspect_repository(
         "--ignore-submodules=none",
     ).stdout
 
+    # Submodules are inspected directly rather than trusted through the parent's descent:
+    # their own status can be told to stay silent, in two ways the superproject cannot see.
+    extra_unverifiable, extra_dirty = _submodule_dirtiness(runner, root)
+    status = _parse_porcelain_v2(
+        status_output,
+        unverifiable=_unverifiable_paths(runner) + extra_unverifiable,
+    )
+    if extra_dirty:
+        known = {module.path for module in status.submodules}
+        status = replace(
+            status,
+            submodules=status.submodules
+            + tuple(
+                SubmoduleState(
+                    path=path_, commit_changed=False, has_modifications=True, has_untracked=False
+                )
+                for path_ in extra_dirty
+                if path_ not in known
+            ),
+        )
+
     remotes = tuple(
         line for line in runner.text("remote", check=False).splitlines() if line.strip()
     )
@@ -940,7 +1047,7 @@ def inspect_repository(
         head_commit=head_commit,
         branch=branch,
         is_detached=is_detached,
-        status=_parse_porcelain_v2(status_output, unverifiable=_unverifiable_paths(runner)),
+        status=status,
         operations_in_progress=_operations_in_progress(git_dir),
         default_branch=default_branch,
         default_branch_source=default_branch_source,

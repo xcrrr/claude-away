@@ -31,7 +31,12 @@ from claude_away.adapters.git import (
     _repository_defined_command_config,
     inspect_repository,
 )
-from claude_away.errors import UnsafeRepositoryConfigError, UnsupportedGitVersionError
+from claude_away.errors import (
+    GitError,
+    NotAGitRepositoryError,
+    UnsafeRepositoryConfigError,
+    UnsupportedGitVersionError,
+)
 from tests.gitfixtures import make_repo
 
 
@@ -825,3 +830,146 @@ class TestEveryGitCallIsBounded:
         monkeypatch.setattr("claude_away.adapters.git.subprocess.run", always_timeout)
         with pytest.raises(GitCommandError, match="timed out"):
             GitRunner(repo.path).run("rev-parse", "HEAD")
+
+
+class TestRoundThreeFindings:
+    """Five HIGH findings and one CRITICAL, all demonstrated by review against 6f06fb1."""
+
+    def _submodule(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        marker = tmp_path / "EXECUTED"
+        payload = tmp_path / "pwn.sh"
+        payload.write_text(
+            f"#!/bin/sh\ncat >/dev/null\necho ran >> {marker}\nprintf 'pristine\\n'\n",
+            encoding="utf-8",
+        )
+        payload.chmod(0o755)
+
+        source = make_repo(tmp_path / "modsrc")
+        source.write("a.txt", "pristine\n")
+        source.write(".gitattributes", "* filter=pwn\n")
+        source.commit_all("inner")
+
+        super_repo = make_repo(tmp_path / "super")
+        super_repo.write("t.txt", "t")
+        super_repo.commit_all("init")
+        super_repo.git(
+            "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source.path), "mod"
+        )
+        super_repo.git("commit", "-q", "-m", "addsub", check=False)
+        return super_repo.path, marker, tmp_path / "super" / ".git" / "modules" / "mod"
+
+    def test_core_worktree_cannot_switch_the_audit_off(self, tmp_path: Path) -> None:
+        """CRITICAL. The skip asked `--show-toplevel`, which honours `core.worktree`.
+
+        `core.worktree` is repository-local -- untrusted scope by this module's own
+        definition -- so the repository decided whether it got audited. Two lines in
+        `.git/modules/<name>/config` pointed it at a decoy, the skip fired, the config was
+        never read, and `git status` descended and ran the filter anyway.
+        """
+        root, marker, module_dir = self._submodule(tmp_path)
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+
+        subprocess.run(
+            [
+                "git",
+                f"--git-dir={module_dir}",
+                "config",
+                "filter.pwn.clean",
+                str(tmp_path / "pwn.sh"),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        subprocess.run(
+            ["git", f"--git-dir={module_dir}", "config", "core.worktree", str(decoy)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(root)
+
+        # Either refusal shape is correct: the audit may name the key, or it may report that
+        # the submodule could not be cleared. What must never happen is acceptance.
+        details = caught.value.details
+        named = details.get("keys") or [details.get("submodule")]
+        assert any("mod" in str(entry) for entry in named), details
+        assert not marker.exists(), "the submodule's filter executed"
+
+    def test_inspecting_a_subdirectory_still_audits_submodules(self, tmp_path: Path) -> None:
+        """HIGH. `git ls-files` is cwd-scoped; `git status` is repo-wide."""
+        root, marker, module_dir = self._submodule(tmp_path)
+        subprocess.run(
+            [
+                "git",
+                f"--git-dir={module_dir}",
+                "config",
+                "filter.pwn.clean",
+                str(tmp_path / "pwn.sh"),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        plain = root / "docs"
+        plain.mkdir()
+        (plain / "note.md").write_text("x", encoding="utf-8")
+
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(plain)
+        assert not marker.exists()
+
+    @pytest.mark.parametrize("route", ["assume-unchanged", "gitmodules-ignore"])
+    def test_a_submodule_cannot_hide_its_own_dirtiness(self, tmp_path: Path, route: str) -> None:
+        """HIGH x2. Both routes silence the CHILD status, which the parent then believes."""
+        root, _, _ = self._submodule(tmp_path)
+        (root / "mod" / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
+
+        if route == "assume-unchanged":
+            subprocess.run(
+                ["git", "-C", str(root / "mod"), "update-index", "--assume-unchanged", "a.txt"],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+        else:
+            (root / ".gitmodules").write_text(
+                '[submodule "mod"]\n\tpath = mod\n\turl = ../modsrc\n\tignore = all\n',
+                encoding="utf-8",
+            )
+
+        status = inspect_repository(root).status
+        assert not status.is_clean, f"{route} hid a modified submodule"
+        assert "mod" in [module.path for module in status.dirty_submodules]
+
+    def test_a_clean_submodule_is_still_clean(self, tmp_path: Path) -> None:
+        root, _, _ = self._submodule(tmp_path)
+        assert inspect_repository(root).status.is_clean
+
+    def test_a_repository_that_cannot_be_classified_is_not_called_a_non_repository(
+        self, tmp_path: Path
+    ) -> None:
+        """HIGH. Every non-zero rev-parse became NotAGitRepositoryError, which the init
+        location guard trusts as a pass."""
+        repo = make_repo(tmp_path / "api")
+        (repo.path / ".git" / "config").write_text(
+            "[core]\n\trepositoryformatversion = 99\n", encoding="utf-8"
+        )
+        with pytest.raises(GitError) as caught:
+            inspect_repository(repo.path)
+        assert not isinstance(caught.value, NotAGitRepositoryError), (
+            "an unreadable repository must not be classified as 'not a repository'"
+        )
+
+    def test_a_chain_of_exactly_the_cap_audits_its_own_config(self, tmp_path: Path) -> None:
+        """HIGH. At exactly the cap the refusal does not fire for a leaf, so the level's own
+        config is the only thing between the controller and an executed filter driver."""
+        from claude_away.adapters.git import _MAX_SUBMODULE_DEPTH
+
+        root, marker = TestSubmoduleConfigIsAudited()._chain(tmp_path, _MAX_SUBMODULE_DEPTH)
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(root)
+        assert not marker.exists()
