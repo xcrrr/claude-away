@@ -653,6 +653,92 @@ class TestSubmoduleConfigIsAudited:
 
         assert _MAX_SUBMODULE_DEPTH >= 2
 
+    def _chain(self, tmp_path: Path, depth: int) -> tuple[Path, Path]:
+        """A chain of `depth` nested gitlinked repositories, hostile filter at the bottom."""
+        marker = tmp_path / "EXECUTED"
+        payload = tmp_path / "payload.sh"
+        payload.write_text(
+            f"#!/bin/sh\necho ran >> {marker}\nprintf 'hello\\n'\n", encoding="utf-8"
+        )
+        payload.chmod(0o755)
+
+        root = make_repo(tmp_path / "r0")
+        levels = [root]
+        current = root
+        for _ in range(depth):
+            current = make_repo(current.path / "sub")
+            levels.append(current)
+
+        deepest = levels[-1]
+        deepest.write("a.txt", "hello\n")
+        deepest.write(".gitattributes", "a.txt filter=pwn\n")
+        deepest.commit_all("inner")
+        deepest.git("config", "--local", "filter.pwn.clean", str(payload))
+        deepest.write("a.txt", "world\n")  # genuine divergence the filter would mask
+
+        for level in reversed(levels[:-1]):
+            level.write("f.txt", "x")
+            level.git("add", "f.txt", "sub", check=False)
+            level.git("commit", "-q", "-m", "level", check=False)
+
+        return root.path, marker
+
+    def test_nesting_deeper_than_the_cap_is_refused_not_silently_unaudited(
+        self, tmp_path: Path
+    ) -> None:
+        """The cap stops the audit; it does not stop Git.
+
+        `git status --ignore-submodules=none` descends the whole chain, so a cap that merely
+        stopped auditing handed back the original critical one level below itself: a filter
+        driver below the cap executed AND masked a real divergence while the audit reported
+        nothing. A bound that silently stops checking is a bypass with a limit constant
+        next to it.
+        """
+        from claude_away.adapters.git import _MAX_SUBMODULE_DEPTH
+
+        root, marker = self._chain(tmp_path, _MAX_SUBMODULE_DEPTH + 2)
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(root)
+
+        assert caught.value.details["depth_limit"] == _MAX_SUBMODULE_DEPTH
+        assert caught.value.details["unaudited"] == ["sub"]
+        assert not marker.exists(), "a submodule below the cap executed during inspection"
+
+    def test_a_chain_within_the_cap_is_audited_rather_than_refused(self, tmp_path: Path) -> None:
+        """The cap must not become a blanket refusal of ordinary nesting."""
+        root, marker = self._chain(tmp_path, 2)
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(root)
+
+        # Audited to the bottom and named, not refused for being deep.
+        assert "depth_limit" not in caught.value.details
+        assert caught.value.details["keys"] == ["sub:sub:filter.pwn.clean"]
+        assert not marker.exists()
+
+    def test_a_child_refusal_without_keys_is_not_swallowed(self, tmp_path: Path) -> None:
+        """The bug that made the depth-cap fix fail on its first attempt.
+
+        The parent absorbed every child `UnsafeRepositoryConfigError` by extending its own
+        offender list from `details["keys"]`. A refusal carrying no keys -- the depth-cap
+        one, or the unreadable-submodule one -- extended nothing, so it was raised and then
+        silently discarded one frame up, and inspection continued as if the subtree were
+        clear.
+        """
+        super_repo = make_repo(tmp_path / "super")
+        inner = make_repo(super_repo.path / "sub")
+        inner.write("f.txt", "x")
+        inner.commit_all("inner")
+        super_repo.git("add", "sub", check=False)
+        super_repo.git("commit", "-q", "-m", "add gitlink", check=False)
+        (inner.path / ".git" / "config").write_text("[core\nbroken\n", encoding="utf-8")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(super_repo.path)
+        assert caught.value.details.get("submodule") == "sub"
+        assert "keys" not in caught.value.details
+
 
 class TestSubmoduleReportingCannotBeSuppressed:
     """`--ignore-submodules=none` is the only thing defeating `ignore = all`, and it was untested."""

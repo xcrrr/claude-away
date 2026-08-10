@@ -631,10 +631,28 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
     was written.
     """
     offenders = list(_repository_defined_command_config(runner))
+    gitlinks = _gitlink_paths(runner)
 
-    if _depth < _MAX_SUBMODULE_DEPTH:
+    if _depth >= _MAX_SUBMODULE_DEPTH:
+        # The depth bound stops *us*, not Git. `git status --ignore-submodules=none`
+        # descends the whole chain, so a cap that merely stopped auditing handed back the
+        # original critical one level below the cap: a filter driver at depth 9 executed and
+        # masked a real divergence while the audit reported nothing. Demonstrated with a
+        # ten-deep chain before this branch existed. A bound that silently stops checking is
+        # a bypass with a limit constant next to it; the honest answer at the cap is to
+        # refuse, because everything below it is genuinely unchecked.
+        if gitlinks:
+            raise UnsafeRepositoryConfigError(
+                "submodule nesting is deeper than this build will audit, and `git status` "
+                "descends further than the audit does; Claude Away will not inspect a "
+                "repository whose deeper configuration it never checked",
+                path=str(path),
+                depth_limit=_MAX_SUBMODULE_DEPTH,
+                unaudited=list(gitlinks),
+            )
+    else:
         root = runner.path("rev-parse", "--show-toplevel").resolve()
-        for relative in _gitlink_paths(runner):
+        for relative in gitlinks:
             worktree = (root / relative).resolve()
             if not worktree.is_dir():
                 continue  # gitlinked but not checked out: nothing to descend into
@@ -666,9 +684,18 @@ def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 
             try:
                 _assert_configuration_is_inert(child, worktree, _depth + 1)
             except UnsafeRepositoryConfigError as exc:
+                keys = exc.details.get("keys", ())
+                if not keys:
+                    # A child refusal that is not a list of offending keys -- the depth-cap
+                    # refusal, or the unreadable-submodule one -- says "this subtree was not
+                    # cleared", not "these keys are bad". Absorbing it into an empty `keys`
+                    # extension silently discarded it, which is how the depth-cap fix failed
+                    # to take on its first attempt: the refusal was raised and then swallowed
+                    # one frame up. Anything without keys propagates unchanged.
+                    raise
                 # Prefixed with the submodule path so the operator is told *where* to look;
                 # "filter.pwn.clean" alone would send them to the wrong .git/config.
-                offenders.extend(f"{relative}:{key}" for key in exc.details.get("keys", ()))
+                offenders.extend(f"{relative}:{key}" for key in keys)
             except GitError as exc:
                 # A submodule we cannot read is a submodule we cannot clear. `git status`
                 # descends into it regardless, so refusing is the only honest answer -- the
