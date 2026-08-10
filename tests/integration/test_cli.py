@@ -529,6 +529,30 @@ class TestInitGuardFailsClosed:
         assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
         assert not (repo.path / "state").exists()
 
+    @pytest.mark.parametrize("shape", ["file-in-chain", "missing-dirs"])
+    def test_a_path_inside_a_repository_is_refused_whatever_the_chain_looks_like(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], shape: str
+    ) -> None:
+        """The walk-up stopped at the nearest existing PATH, not the nearest directory.
+
+        A file in the chain therefore ended it, `git -C <file>` failed, and the guard read
+        that failure as "not a repository" and passed. The ledger did not land there because
+        mkdir fails next, but the guard was answering a different question than it appears
+        to and answering it the unsafe way.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        if shape == "file-in-chain":
+            (repo.path / "afile").write_text("x", encoding="utf-8")
+            target = repo.path / "afile" / "b" / "state.db"
+        else:
+            target = repo.path / "deep" / "nested" / "state.db"
+
+        assert main(["--json", "--db", str(target), "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+        assert not list(repo.path.rglob("state.db"))
+
     def test_a_genuine_non_repository_is_still_allowed(self, tmp_path: Path) -> None:
         assert main(["--json", "--db", str(tmp_path / "elsewhere" / "state.db"), "init"]) == EXIT_OK
 

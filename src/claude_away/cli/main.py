@@ -136,8 +136,14 @@ def _assert_db_outside_a_repository(path: Path) -> None:
     audit had one layer down: a check that did not run is not a pass.
     """
     resolved = path.expanduser().resolve()
+    # Nearest existing DIRECTORY, not nearest existing path. Stopping at the first thing
+    # that exists meant a *file* in the chain ended the walk -- `--db <repo>/somefile/x/db`
+    # probed `<repo>/somefile`, `git -C` on a file fails, and the guard read that as "not a
+    # repository" and passed. The ledger did not actually land there (mkdir fails next), but
+    # the guard was answering a different question than it appears to, and its answer was
+    # the unsafe one.
     probe = resolved.parent
-    while not probe.exists() and probe.parent != probe:
+    while not probe.is_dir() and probe.parent != probe:
         probe = probe.parent
 
     try:
