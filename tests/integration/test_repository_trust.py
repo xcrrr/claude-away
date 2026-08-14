@@ -49,12 +49,43 @@ def marker_script(tmp_path: Path, marker: Path, *, exit_code: int = 1) -> Path:
 
 
 class TestFsmonitorCannotExecute:
-    def test_inspection_does_not_run_the_repositorys_fsmonitor(self, tmp_path: Path) -> None:
+    def test_a_repository_local_fsmonitor_is_refused_outright(self, tmp_path: Path) -> None:
+        """The repository-scoped case is now a refusal, not a silent override.
+
+        `core.fsmonitor` is not on the repository-local allow-list, so a repository that
+        sets it is refused before any status runs. The `-c` pin still exists and still
+        applies -- see the global-scope test below -- but it is no longer the only thing
+        standing between the controller and a hook the repository chose.
+        """
         repo = make_repo(tmp_path / "r")
         marker = tmp_path / "EXECUTED"
         repo.git("config", "core.fsmonitor", str(marker_script(tmp_path, marker)))
 
-        inspect_repository(repo.path)
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+
+        assert any("fsmonitor" in key.lower() for key in caught.value.details["keys"])
+        assert not marker.exists(), "core.fsmonitor ran during a read-only inspection"
+
+    def test_a_globally_configured_fsmonitor_is_pinned_off_rather_than_run(
+        self, tmp_path: Path
+    ) -> None:
+        """Global scope is the operator's, so the allow-list does not see it -- the pin does.
+
+        `HOME` rather than `GIT_CONFIG_GLOBAL`: the adapter strips the whole `GIT_*`
+        namespace, so a fixture built on that variable would prove nothing.
+        """
+        repo = make_repo(tmp_path / "r")
+        marker = tmp_path / "EXECUTED"
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(
+            f"[core]\n\tfsmonitor = {marker_script(tmp_path, marker)}\n", encoding="utf-8"
+        )
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("HOME", str(home))
+            inspect_repository(repo.path)
 
         assert not marker.exists(), "core.fsmonitor ran during a read-only inspection"
 
@@ -64,6 +95,11 @@ class TestFsmonitorCannotExecute:
         A v2 hook that always answers "nothing changed" made a genuinely modified tracked
         file invisible to `git status`, so `is_clean` was True and the base resolved --
         exactly the uncommitted work `base_revision` exists to refuse to build on.
+
+        Driven from *global* scope, which the allow-list deliberately does not police, so
+        the only thing that can produce the correct answer here is the `-c` pin. The hook is
+        installed locally first purely to prime the index extension, the way a real
+        fsmonitor deployment would, and then moved.
         """
         repo = make_repo(tmp_path / "r")
         repo.write("tracked.txt", "original\n")
@@ -76,11 +112,19 @@ class TestFsmonitorCannotExecute:
         # Prime the index extension the way a real fsmonitor deployment would be.
         repo.git("status", check=False)
         repo.git("status", check=False)
+        repo.git("config", "--unset", "core.fsmonitor")
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {liar}\n", encoding="utf-8")
 
         repo.write("tracked.txt", "SOMEBODY ELSE'S UNCOMMITTED WORK\n")
         os.utime(repo.path / "tracked.txt", (0, 0))  # defeat the stat-based shortcut too
 
-        status = inspect_repository(repo.path).status
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("HOME", str(home))
+            status = inspect_repository(repo.path).status
+
         assert not status.is_clean
         assert "tracked.txt" in status.unstaged
 
@@ -321,12 +365,42 @@ class TestDiscoveredDefaultBranchProvenance:
         assert inspection.default_branch == "trunk"
         assert inspection.default_branch_source == "origin_head"
 
-    def test_a_repository_written_init_default_branch_is_ignored(self, tmp_path: Path) -> None:
-        """One appended line in .git/config used to move protection off the real default."""
+    def test_a_repository_written_init_default_branch_is_refused(self, tmp_path: Path) -> None:
+        """One appended line in .git/config used to move protection off the real default.
+
+        `init.defaultBranch` is a personal preference about what `git init` should name a
+        *new* repository's first branch. It has no bearing on an existing repository, so it
+        is not on the repository-local allow-list and the appended line is now refused
+        rather than merely disregarded.
+        """
         repo = make_repo(tmp_path / "r", initial_branch="main")
         with (repo.path / ".git" / "config").open("a", encoding="utf-8") as handle:
             handle.write("[init]\n\tdefaultBranch = attacker-branch\n")
-        inspection = inspect_repository(repo.path)
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert any(key.lower() == "init.defaultbranch" for key in caught.value.details["keys"])
+
+    def test_a_globally_configured_init_default_branch_is_still_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        """The operator's own preference is allowed to exist and still must not be consulted.
+
+        Refusing the local key would be an empty victory if the resolver simply read the
+        global one instead: `default_branch` decides which branch is protected, and a
+        preference about naming new repositories is not a fact about this one.
+        """
+        repo = make_repo(tmp_path / "r", initial_branch="main")
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(
+            "[init]\n\tdefaultBranch = attacker-branch\n", encoding="utf-8"
+        )
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("HOME", str(home))
+            inspection = inspect_repository(repo.path)
+
         assert inspection.default_branch is None
         assert inspection.default_branch_source is None
 
@@ -746,7 +820,13 @@ class TestSubmoduleConfigIsAudited:
 
 
 class TestSubmoduleReportingCannotBeSuppressed:
-    """`--ignore-submodules=none` is the only thing defeating `ignore = all`, and it was untested."""
+    """`ignore = all` silences Git's own descent, in `.gitmodules` or in `.git/config`.
+
+    The previous answer was `--ignore-submodules=none`, which overrode the setting but left
+    Git deciding what to run and where. Submodules are now walked explicitly instead, so
+    `ignore` is not overridden -- it is simply never consulted, because nothing asks Git to
+    descend in the first place.
+    """
 
     def _dirty_submodule(self, tmp_path: Path, *, where: str) -> Path:
         super_repo = make_repo(tmp_path / "super")
@@ -899,8 +979,19 @@ class TestRoundThreeFindings:
         assert any("mod" in str(entry) for entry in named), details
         assert not marker.exists(), "the submodule's filter executed"
 
-    def test_inspecting_a_subdirectory_still_audits_submodules(self, tmp_path: Path) -> None:
-        """HIGH. `git ls-files` is cwd-scoped; `git status` is repo-wide."""
+    def test_inspecting_a_subdirectory_is_refused_rather_than_widened(self, tmp_path: Path) -> None:
+        """Originally HIGH: `git ls-files` is cwd-scoped while `git status` is repo-wide, so
+        inspecting a subdirectory audited no submodules while Git descended into all of them.
+
+        The boundary answers it differently now. Resolving a subdirectory to its repository
+        root meant asking `git rev-parse --show-toplevel`, and that is exactly where
+        `core.worktree` gets a vote -- the fourth review round's critical. The layout comes
+        from the filesystem instead, so a path with no `.git` of its own is refused outright.
+        That is strictly stronger than auditing it correctly: nothing is inspected, nothing
+        is executed, and no scope is silently widened past what the operator named.
+        `TestPathRejection.test_subdirectory_does_not_silently_widen_to_the_repository`
+        pins the enrolment-level message.
+        """
         root, marker, module_dir = self._submodule(tmp_path)
         subprocess.run(
             [
@@ -918,7 +1009,7 @@ class TestRoundThreeFindings:
         plain.mkdir()
         (plain / "note.md").write_text("x", encoding="utf-8")
 
-        with pytest.raises(UnsafeRepositoryConfigError):
+        with pytest.raises(NotAGitRepositoryError):
             inspect_repository(plain)
         assert not marker.exists()
 

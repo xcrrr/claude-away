@@ -28,35 +28,63 @@ one release out of date.
 not recognise reports a dirty repository as clean, and "clean" is the answer that gets
 somebody else's uncommitted work built on top of.
 
-**A repository's own configuration is not trusted.** This one is easy to miss, and it is
-the reason ``read-only`` was in scare quotes until Milestone 2A's review. Several Git
-configuration keys hold *commands that Git executes*, and ``git status`` is enough to fire
-them: ``core.fsmonitor`` runs on every invocation, and a ``filter.<driver>.clean`` runs
-whenever a tracked file's content has to be examined. A repository is data that Claude Away
-is pointed at -- and in Milestone 2B it is data Claude itself can write -- so honouring
+**A repository's own configuration is not trusted, and neither is its account of itself.**
+This is the reason ``read-only`` was in scare quotes until Milestone 2A's review. Several
+Git configuration keys hold *commands that Git executes*, and ``git status`` is enough to
+fire them: ``core.fsmonitor`` runs on every invocation, and a ``filter.<driver>.clean``
+runs whenever a tracked file's content has to be examined. A repository is data that Claude
+Away is pointed at -- and in Milestone 2B it is data Claude itself can write -- so honouring
 those keys would mean the deterministic controller executes code chosen by the thing it is
 supposed to be supervising. Worse than the execution: an ``fsmonitor`` hook decides *what
 Git thinks changed*, so a hostile one makes a modified worktree report clean, which is
 precisely the guard :mod:`claude_away.core.base_revision` exists to provide.
 
-Two defences, because neither is sufficient alone. Keys that name a command and have a
-fixed name are pinned on every invocation via ``-c`` (highest precedence, so the
-repository's value never applies). Keys that cannot be pinned because the name is
-user-chosen -- ``filter.*``, ``diff.*``, ``merge.*`` -- are audited before the first command
-that could trigger them, and a repository that sets one *in its own config* is refused.
-Scope matters there: the operator's global configuration is trusted (that is where
-``git lfs install`` puts its filters), the repository's is not.
+Four review rounds each found a critical in the previous round's fix, and all four were the
+same shape: a repository-controlled configuration key changed what the controller executed
+or believed. The last two were the same key, ``core.worktree``, used two different ways --
+first to switch the audit off, then to redirect which directory was inspected while the
+audit ran happily against the real one. The lesson was not that a key had been missed. A
+deny-list over Git's configuration space cannot be completed by inspection, and
+``core.worktree`` is not even command-bearing: ``git submodule add`` writes it legitimately.
+
+So the deny-list is no longer the trust model. Three controls are, and all three are needed:
+
+1. **Layout comes from the filesystem.** :func:`~claude_away.adapters.gitlayout.discover_layout`
+   reads ``.git`` directly -- directory, ``gitdir:`` pointer, ``commondir`` -- with no Git
+   process at all, because ``git rev-parse`` is precisely where ``core.worktree`` gets a
+   vote. ``inspect_repository`` therefore requires a repository *root* and refuses anything
+   else, rather than resolving a subdirectory through Git.
+2. **Repository-local configuration is default-deny.**
+   :func:`~claude_away.adapters.gitlayout.audit_local_config` accepts a small allow-list of
+   keys a normal repository needs, validates the values that decide identity, refuses
+   includes outright, and refuses everything else -- so the next key Git invents is handled
+   before anyone hears about it. Scope matters: the operator's global configuration is
+   trusted (that is where ``git lfs install`` puts its filters), the repository's is not.
+3. **Every invocation is bound.** ``--git-dir`` and ``--work-tree`` are passed explicitly
+   from the validated layout, so no configuration value, working directory or enclosing
+   repository can change which tree is inspected. Submodules are then walked explicitly by
+   :func:`_inspect_subtree` with ``--ignore-submodules=all``, so Git never chooses to
+   descend into a repository that has not been through controls 1-3.
+
+The ``-c`` pins in :data:`_PINNED_CONFIG` and the command-key audit in
+:func:`_repository_defined_command_config` both remain, now as defence in depth rather than
+as the boundary itself.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from claude_away.adapters.gitlayout import (
+    RepositoryLayout,
+    audit_local_config,
+    discover_layout,
+)
 from claude_away.errors import (
     GitCommandError,
     GitError,
@@ -83,9 +111,10 @@ __all__ = [
 MINIMUM_GIT_VERSION = "2.26"
 """The oldest Git this adapter works with.
 
-Set by the newest flag in use: ``--porcelain=v2`` needs 2.11, ``--absolute-git-dir`` 2.13,
-``--no-optional-locks`` 2.15, and ``git config --list --show-scope`` -- which the
-repository-configuration audit depends on -- needs 2.26.
+Set by the newest flag in use: ``--porcelain=v2`` needs 2.11, ``--no-optional-locks`` 2.15,
+and ``git config --list --show-scope`` -- which the command-key audit depends on -- needs
+2.26. ``git config --file ... --no-includes --list -z``, which the allow-list audit uses,
+is much older; the floor is set by the defence-in-depth check rather than by the boundary.
 """
 
 GIT_TIMEOUT_SECONDS = 60
@@ -333,9 +362,22 @@ def is_safe_ref(ref: str) -> bool:
 class GitRunner:
     """Runs read-only Git commands against one working tree."""
 
-    def __init__(self, cwd: Path, *, timeout: int = GIT_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        timeout: int = GIT_TIMEOUT_SECONDS,
+        layout: RepositoryLayout | None = None,
+    ) -> None:
         self.cwd = cwd
         self.timeout = timeout
+        self.layout = layout
+        """When set, every invocation is bound to this validated identity.
+
+        `-C <path>` lets Git discover the repository, and discovery consults `core.worktree`
+        -- which is repository-controlled. Passing `--git-dir` and `--work-tree` explicitly
+        removes that vote: no configuration value, working directory or enclosing repository
+        can change which tree is inspected."""
 
     def _environment(self) -> dict[str, str]:
         environment = {
@@ -362,7 +404,16 @@ class GitRunner:
         for key, value in _PINNED_CONFIG:
             pinned += ["-c", f"{key}={value}"]
 
-        argv = ["git", "-C", str(self.cwd), "--no-optional-locks", *pinned, *arguments]
+        if self.layout is not None:
+            location = [
+                f"--git-dir={self.layout.git_dir}",
+                f"--work-tree={self.layout.worktree}",
+                "-C",
+                str(self.layout.worktree),
+            ]
+        else:
+            location = ["-C", str(self.cwd)]
+        argv = ["git", *location, "--no-optional-locks", *pinned, *arguments]
         try:
             completed = subprocess.run(
                 argv,
@@ -580,14 +631,22 @@ def _repository_defined_command_config(runner: GitRunner) -> list[str]:
     return offenders
 
 
-def _gitlink_paths(runner: GitRunner) -> tuple[str, ...]:
-    """Repository-relative paths of gitlink entries -- that is, submodules.
+def _gitlink_entries(runner: GitRunner) -> tuple[tuple[str, str], ...]:
+    """``(path, recorded_oid)`` for every gitlink entry -- that is, every submodule.
 
     Read from the index (``git ls-files -s``), not from ``.gitmodules`` and not from
-    ``git submodule``: the index is what ``git status`` actually consults when it decides
-    to descend, and it is a plain file read that executes nothing. A submodule removed from
-    ``.gitmodules`` but still gitlinked is still descended into, so ``.gitmodules`` would be
-    the wrong source.
+    ``git submodule``: the index is the authoritative record of what the superproject
+    committed, and it is a plain file read that executes nothing. ``.gitmodules`` is tracked
+    *content*, which the repository can rewrite in an ordinary commit, so it would be the
+    wrong source for a security-relevant enumeration.
+
+    The recorded object id is carried because submodules are inspected with
+    ``--ignore-submodules=all``, which also suppresses the "commit changed" signal. That
+    comparison is therefore made here, against the child's real HEAD, rather than trusted
+    to a porcelain field the parent's own configuration can turn off.
+
+    Output is relative to the runner's directory, and the runner is bound to the working
+    tree root, so these are root-relative paths.
     """
     completed = runner.run("ls-files", "-s", "-z", check=False)
     if completed.returncode != 0:
@@ -597,15 +656,19 @@ def _gitlink_paths(runner: GitRunner) -> tuple[str, ...]:
             completed.stderr.decode("utf-8", "replace")[:_MAX_STDERR_CHARS],
         )
 
-    paths: list[str] = []
+    entries: list[tuple[str, str]] = []
     for record in completed.stdout.split(b"\x00"):
         if not record:
             continue
         # "<mode> <object> <stage>\t<path>"
         metadata, separator, raw_path = record.partition(b"\t")
-        if separator and metadata.startswith(b"160000 "):
-            paths.append(_decode(raw_path))
-    return tuple(paths)
+        if not separator or not metadata.startswith(b"160000 "):
+            continue
+        fields = metadata.split(b" ")
+        if len(fields) < 3:
+            raise GitOutputError("unparseable ls-files entry", record=_decode(record[:200]))
+        entries.append((_decode(raw_path), fields[1].decode("ascii", "replace")))
+    return tuple(entries)
 
 
 #: How deep to follow nested submodules. Submodules nest legitimately but not deeply, and a
@@ -613,128 +676,243 @@ def _gitlink_paths(runner: GitRunner) -> tuple[str, ...]:
 _MAX_SUBMODULE_DEPTH = 8
 
 
-def _assert_configuration_is_inert(runner: GitRunner, path: Path, _depth: int = 0) -> None:
-    """Refuse a repository -- or any submodule of it -- that names commands Git would run.
+#: How many repositories one inspection will visit in total. The depth cap alone does not
+#: bound the walk: a repository controls how many gitlinks each level holds, and the same
+#: subtree may be gitlinked from many paths, so `breadth ** depth` repositories is a shape
+#: the repository can choose. Per-branch cycle detection does not help, because none of
+#: those paths is a cycle. This is the flat bound, and like the depth cap it refuses rather
+#: than truncating -- a walk that stopped early would report "clean" about a subtree nobody
+#: looked at.
+_MAX_INSPECTED_REPOSITORIES = 256
 
-    The recursion is the whole point, and its absence was a critical hole. ``git status
-    --ignore-submodules=none`` spawns a child ``git status`` inside every gitlinked
-    submodule, and that child reads the *submodule's* own ``.git/config``. Auditing only the
-    superproject left a repository free to put ``filter.<driver>.clean`` one directory down
-    and have the controller run it -- while the ``-c`` pins, which do propagate into the
-    child, made the other half of the defence look like it was working.
 
-    The masking half is worse than the execution half. A clean filter defines what Git
-    compares the worktree against, so a driver that always emits the pristine blob makes a
-    genuinely modified submodule report clean: ``awayctl repos`` said ``ready=1/1``,
-    ``dirty_submodules=[]`` and ``resolved=True`` for a tree carrying somebody else's
-    uncommitted work. Demonstrated with a real ``git submodule add`` submodule before this
-    was written.
-    """
-    offenders = list(_repository_defined_command_config(runner))
-    # Listed from the repository ROOT, not from `runner.cwd`. `git ls-files` reports only
-    # paths at or below the current directory, and reports them relative to it, while
-    # `git status` is repo-wide regardless of cwd. Inspecting a subdirectory therefore
-    # audited no submodules at all while Git still descended into every one of them.
-    root_runner = GitRunner(
-        runner.path("rev-parse", "--show-toplevel").resolve(), timeout=runner.timeout
-    )
-    gitlinks = _gitlink_paths(root_runner)
+@dataclass(slots=True)
+class _WalkBudget:
+    """Shared across one inspection, unlike ``visited``, which is per-branch."""
 
-    if _depth >= _MAX_SUBMODULE_DEPTH:
-        # The depth bound stops *us*, not Git. `git status --ignore-submodules=none`
-        # descends the whole chain, so a cap that merely stopped auditing handed back the
-        # original critical one level below the cap: a filter driver at depth 9 executed and
-        # masked a real divergence while the audit reported nothing. Demonstrated with a
-        # ten-deep chain before this branch existed. A bound that silently stops checking is
-        # a bypass with a limit constant next to it; the honest answer at the cap is to
-        # refuse, because everything below it is genuinely unchecked.
-        if gitlinks:
+    remaining: int = field(default_factory=lambda: _MAX_INSPECTED_REPOSITORIES)
+
+    def spend(self, path: Path) -> None:
+        if self.remaining <= 0:
             raise UnsafeRepositoryConfigError(
-                "submodule nesting is deeper than this build will audit, and `git status` "
-                "descends further than the audit does; Claude Away will not inspect a "
-                "repository whose deeper configuration it never checked",
+                "this repository tree contains more gitlinked repositories than one "
+                "inspection will visit; Claude Away will not report on a tree it only "
+                "partly walked",
                 path=str(path),
-                depth_limit=_MAX_SUBMODULE_DEPTH,
-                unaudited=list(gitlinks),
+                repository_limit=_MAX_INSPECTED_REPOSITORIES,
             )
-    else:
-        root = root_runner.cwd
-        own_git_dir = runner.path("rev-parse", "--absolute-git-dir").resolve()
-        for relative in gitlinks:
-            worktree = (root / relative).resolve()
-            if not worktree.is_dir():
-                continue  # gitlinked but not checked out: nothing to descend into
+        self.remaining -= 1
 
-            child = GitRunner(worktree, timeout=runner.timeout)
-            try:
-                # `--absolute-git-dir`, NOT `--show-toplevel`. The skip below exists only to
-                # avoid re-auditing the superproject when a gitlinked path is not itself a
-                # repository (Git walks *up* from `-C`), and `--show-toplevel` was the wrong
-                # question to ask: it honours `core.worktree`, which lives in the submodule's
-                # own config -- untrusted scope by this module's own definition. So the
-                # repository could decide whether it got audited. Two lines in
-                # `.git/modules/<name>/config` pointed `--show-toplevel` at a decoy, the skip
-                # fired, the audit never read the config, and `git status` descended and ran
-                # the filter anyway: four executions and a dirty tree reported clean. The git
-                # directory is the identity that actually distinguishes "another repository"
-                # from "walked back up to this one", and `core.worktree` cannot move it.
-                child_git_dir = child.path("rev-parse", "--absolute-git-dir").resolve()
-            except GitError as exc:
-                # Git could not say what this path is -- a corrupt submodule config does
-                # this. Skipping would be the wrong answer twice over: `git status` descends
-                # regardless and fails there with an untyped error, and "we could not look"
-                # must never read as "nothing to find".
-                raise UnsafeRepositoryConfigError(
-                    "a submodule's Git configuration could not be read, and `git status` "
-                    "descends into it regardless; Claude Away will not inspect a repository "
-                    "it cannot fully check",
-                    path=str(path),
-                    submodule=relative,
-                    detail=exc.message,
-                ) from exc
-            if child_git_dir == own_git_dir:
-                # The gitlinked path is not its own repository: Git walked up and handed us
-                # this repository again. There is no separate config to read, and recursing
-                # would re-audit the superproject once per level to the depth cap while
-                # learning nothing. Any *other* git directory is a real second repository
-                # whose config `git status` will read, so it is audited.
-                continue
 
-            try:
-                _assert_configuration_is_inert(child, worktree, _depth + 1)
-            except UnsafeRepositoryConfigError as exc:
-                keys = exc.details.get("keys", ())
-                if not keys:
-                    # A child refusal that is not a list of offending keys -- the depth-cap
-                    # refusal, or the unreadable-submodule one -- says "this subtree was not
-                    # cleared", not "these keys are bad". Absorbing it into an empty `keys`
-                    # extension silently discarded it, which is how the depth-cap fix failed
-                    # to take on its first attempt: the refusal was raised and then swallowed
-                    # one frame up. Anything without keys propagates unchanged.
-                    raise
-                # Prefixed with the submodule path so the operator is told *where* to look;
-                # "filter.pwn.clean" alone would send them to the wrong .git/config.
-                offenders.extend(f"{relative}:{key}" for key in keys)
-            except GitError as exc:
-                # A submodule we cannot read is a submodule we cannot clear. `git status`
-                # descends into it regardless, so refusing is the only honest answer -- the
-                # same rule as the audit itself: a check that did not run is not a pass.
-                raise UnsafeRepositoryConfigError(
-                    "a submodule's Git configuration could not be checked, and `git status` "
-                    "descends into it regardless; Claude Away will not inspect a repository "
-                    "it cannot fully check",
-                    path=str(path),
-                    submodule=relative,
-                ) from exc
+@dataclass(frozen=True, slots=True)
+class _Subtree:
+    """One repository's own state plus everything gitlinked beneath it."""
 
+    head_commit: str | None
+    status: WorktreeStatus
+    """This repository alone. Run with ``--ignore-submodules=all``, so no child process."""
+
+    descendants: tuple[SubmoduleState, ...]
+    """Every gitlink at or below here, path-prefixed relative to this repository."""
+
+    nested_unverifiable: tuple[str, ...]
+    """Unverifiable paths below here, path-prefixed. Excludes this repository's own."""
+
+    @property
+    def is_dirty(self) -> bool:
+        return not self.status.is_clean or any(module.is_dirty for module in self.descendants)
+
+
+def _inspect_subtree(
+    layout: RepositoryLayout,
+    *,
+    timeout: int,
+    depth: int,
+    visited: frozenset[Path],
+    budget: _WalkBudget,
+) -> _Subtree:
+    """Inspect one repository and, explicitly, every repository gitlinked beneath it.
+
+    This is the single recursion. Configuration validation and dirtiness collection happen
+    in the same walk over the same set of repositories, because keeping them apart is what
+    produced round two's critical: the audit descended and the status did not, so a
+    submodule could be cleared by one and never looked at by the other -- and then round
+    four's, where the two disagreed about *which directory* a repository even was.
+
+    Each level does the same five things, in order:
+
+    1. establish the layout from the filesystem (the caller has already done this for the
+       top level; children are discovered here);
+    2. refuse the repository if its own configuration is not on the allow-list;
+    3. build a runner bound to that validated layout with explicit ``--git-dir`` and
+       ``--work-tree``;
+    4. run *that repository's* status with submodules ignored for that individual command,
+       so Git never spawns a child process inside a repository we have not cleared yet;
+    5. enumerate gitlinks from its index and recurse into each initialised child.
+
+    ``--ignore-submodules=all`` is deliberate and is the opposite of the previous design's
+    ``=none``. ``=none`` asked Git to descend, which meant Git chose what to run and where,
+    reading configuration from directories the caller had not validated. Ignoring submodules
+    for the command and walking them here means every child is reached through steps 1-3
+    first. The signals ``=none`` used to provide -- changed commit, modified content,
+    untracked content -- are reconstructed from the child's own inspection, which is
+    strictly more information: it also carries assume-unchanged and skip-worktree paths,
+    which no parent porcelain has ever reported.
+    """
+    if layout.git_dir in visited:
+        # Two paths resolving to one git directory. Recursing would either loop or audit the
+        # same repository repeatedly to the depth cap while learning nothing, and a cycle in
+        # a structure the repository controls is not something to walk optimistically.
+        raise UnsafeRepositoryConfigError(
+            "a submodule points at a git directory already being inspected; refusing to "
+            "walk a cycle in a repository-controlled structure",
+            path=str(layout.worktree),
+            git_dir=str(layout.git_dir),
+        )
+    visited = visited | {layout.git_dir}
+    budget.spend(layout.worktree)
+
+    runner = GitRunner(layout.worktree, timeout=timeout, layout=layout)
+
+    # Command-bearing keys first. This check reads the *effective* configuration, so it also
+    # covers anything an include drags in, and it is the check that fails closed on a Git too
+    # old to report scopes. `git config --list` executes nothing; it reads files.
+    offenders = _repository_defined_command_config(runner)
     if offenders:
         raise UnsafeRepositoryConfigError(
             "repository-local Git configuration defines commands that Git would execute "
             "during inspection; Claude Away will not run them. Move the setting to your "
             "global configuration if you trust it, or remove it",
-            path=str(path),
+            path=str(layout.worktree),
             keys=offenders,
         )
+
+    # Then default-deny over everything else, parsed inertly from the files themselves.
+    audit_local_config(layout, timeout=timeout)
+
+    head = runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    head_commit = head.stdout.decode().strip() if head.returncode == 0 else None
+
+    gitlinks = _gitlink_entries(runner)
+    if gitlinks and depth >= _MAX_SUBMODULE_DEPTH:
+        # A bound that silently stops checking is a bypass with a limit constant next to it.
+        # Nothing below the cap has been inspected, so the honest answer is a refusal rather
+        # than a verdict computed from a subtree nobody looked at.
+        raise UnsafeRepositoryConfigError(
+            "submodule nesting is deeper than this build will inspect; Claude Away will not "
+            "report on a repository whose deeper configuration and content it never checked",
+            path=str(layout.worktree),
+            depth_limit=_MAX_SUBMODULE_DEPTH,
+            unaudited=[relative for relative, _ in gitlinks],
+        )
+
+    descendants: list[SubmoduleState] = []
+    nested_unverifiable: list[str] = []
+
+    for relative, recorded_oid in gitlinks:
+        child_path = layout.worktree / relative
+        try:
+            child_layout = discover_layout(child_path)
+        except NotAGitRepositoryError:
+            # Gitlinked but not initialised: no working tree, no configuration, nothing to
+            # carry into a branch. `--ignore-submodules=all` means Git does not descend into
+            # it either, so there is genuinely nothing here.
+            continue
+        except UnsupportedRepositoryError as exc:
+            raise UnsafeRepositoryConfigError(
+                "a submodule's layout could not be established; Claude Away will not report "
+                "on a repository it cannot fully inspect",
+                path=str(layout.worktree),
+                submodule=relative,
+                detail=exc.message,
+            ) from exc
+
+        if not child_layout.worktree.is_relative_to(layout.worktree):
+            # The gitlink path resolved outside its own superproject -- a symlink, or a
+            # `..` component. Inspecting it would mean reporting on a tree the operator
+            # never enrolled.
+            raise UnsafeRepositoryConfigError(
+                "a submodule path resolves outside its superproject; refusing to inspect a "
+                "directory the repository chose",
+                path=str(layout.worktree),
+                submodule=relative,
+            )
+
+        try:
+            child = _inspect_subtree(
+                child_layout,
+                timeout=timeout,
+                depth=depth + 1,
+                visited=visited,
+                budget=budget,
+            )
+        except UnsafeRepositoryConfigError as exc:
+            keys = exc.details.get("keys", ())
+            if not keys:
+                # A refusal that is not a list of offending keys -- the depth cap, a cycle,
+                # an unreadable child -- says "this subtree was not cleared", not "these keys
+                # are bad". Folding it into an empty key list discarded it silently once
+                # already, so anything without keys propagates unchanged.
+                raise
+            # Prefixed so the operator is told *where* to look: "filter.pwn.clean" alone
+            # sends them to the wrong .git/config.
+            raise UnsafeRepositoryConfigError(
+                exc.message,
+                path=str(layout.worktree),
+                keys=[f"{relative}:{key}" for key in keys],
+            ) from exc
+        except GitError as exc:
+            # "We could not look" must never read as "nothing to find".
+            raise UnsafeRepositoryConfigError(
+                "a submodule could not be inspected; Claude Away will not report on a "
+                "repository it cannot fully check",
+                path=str(layout.worktree),
+                submodule=relative,
+                detail=exc.message,
+            ) from exc
+
+        descendants.append(
+            SubmoduleState(
+                path=relative,
+                commit_changed=child.head_commit != recorded_oid,
+                has_modifications=bool(
+                    child.status.staged
+                    or child.status.unstaged
+                    or child.status.unmerged
+                    or child.status.unverifiable
+                    or any(module.is_dirty for module in child.descendants)
+                ),
+                has_untracked=bool(child.status.untracked),
+            )
+        )
+        descendants.extend(
+            replace(module, path=f"{relative}/{module.path}") for module in child.descendants
+        )
+        nested_unverifiable.extend(f"{relative}/{entry}" for entry in child.status.unverifiable)
+        nested_unverifiable.extend(f"{relative}/{entry}" for entry in child.nested_unverifiable)
+
+    # Last, once every child below has been cleared. `--ignore-submodules=all` stops Git
+    # spawning a status inside a submodule, but it does not stop Git *reading* the
+    # submodule's configuration file -- an unparseable one aborts the parent's status with
+    # exit 128. So the parent's own status is the final step rather than the first: by the
+    # time it runs, every configuration file it will touch has been through the allow-list.
+    status = _parse_porcelain_v2(
+        runner.run(
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ).stdout,
+        unverifiable=_unverifiable_paths(runner),
+    )
+
+    return _Subtree(
+        head_commit=head_commit,
+        status=status,
+        descendants=tuple(descendants),
+        nested_unverifiable=tuple(nested_unverifiable),
+    )
 
 
 def _unverifiable_paths(runner: GitRunner) -> tuple[str, ...]:
@@ -757,60 +935,6 @@ def _unverifiable_paths(runner: GitRunner) -> tuple[str, ...]:
         if tag.islower() or tag == b"S":
             flagged.append(_decode(record[2:]))
     return tuple(flagged)
-
-
-def _submodule_dirtiness(runner: GitRunner, root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Walk submodules ourselves and report what their own status would hide.
-
-    Two masking routes made a dirty submodule report clean, and neither is visible from the
-    superproject's porcelain:
-
-    * ``git update-index --assume-unchanged`` inside a submodule silences that submodule's
-      child ``git status``, so nothing reaches the parent. ``unverifiable`` was read from the
-      superproject index only, so it stayed empty.
-    * ``submodule.<name>.ignore = all`` is honoured by the *child* status. It can live in the
-      submodule's own config or in ``.gitmodules`` -- tracked content, which is not a config
-      scope at all, so the command-key audit cannot see it and ``--ignore-submodules=none``
-      on the top-level call does not reach it.
-
-    Rather than trust the descent, each submodule is inspected directly with our own pinned
-    configuration and our own flags. Returns ``(unverifiable, dirty)``, both repository-
-    relative and prefixed with the submodule path.
-    """
-    unverifiable: list[str] = []
-    dirty: list[str] = []
-
-    for relative in _gitlink_paths(runner):
-        worktree = (root / relative).resolve()
-        if not worktree.is_dir():
-            continue
-        child = GitRunner(worktree, timeout=runner.timeout)
-        try:
-            if (
-                child.path("rev-parse", "--absolute-git-dir").resolve()
-                == runner.path("rev-parse", "--absolute-git-dir").resolve()
-            ):
-                continue  # walked back up to this repository; not a separate submodule
-            own = child.run(
-                "status",
-                "--porcelain=v2",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-            ).stdout
-            child_status = _parse_porcelain_v2(own, unverifiable=_unverifiable_paths(child))
-        except GitError:
-            # Unreadable submodule: the config audit refuses these before we get here, so
-            # reaching this point means something changed underneath us. Treat it as dirty
-            # rather than clean -- an unreadable subtree is not an inspected one.
-            dirty.append(relative)
-            continue
-
-        unverifiable.extend(f"{relative}/{entry}" for entry in child_status.unverifiable)
-        if not child_status.is_clean:
-            dirty.append(relative)
-
-    return tuple(unverifiable), tuple(dirty)
 
 
 def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
@@ -927,72 +1051,20 @@ def _resolve_default_branch(
 def inspect_repository(
     path: Path, *, configured_default_branch: str | None = None, timeout: int = GIT_TIMEOUT_SECONDS
 ) -> RepositoryInspection:
-    """Describe the repository at ``path``. Never mutates, never reaches the network."""
-    runner = GitRunner(path, timeout=timeout)
+    """Describe the repository at ``path``. Never mutates, never reaches the network.
 
-    inside = runner.run("rev-parse", "--is-inside-work-tree", check=False)
-    if inside.returncode != 0:
-        stderr = inside.stderr.decode("utf-8", "replace")
-        if "unknown option" in stderr or "unknown switch" in stderr:
-            # An option this build relies on was rejected, which means the Git on PATH is
-            # older than the adapter requires -- not that the path is not a repository.
-            # Reporting it as "not a repository" sent the operator to check their config
-            # when the problem was their toolchain.
-            raise UnsupportedGitVersionError(
-                f"the installed git does not accept an option this build requires; "
-                f"git {MINIMUM_GIT_VERSION} or newer is needed",
-                path=str(path),
-                stderr=stderr[:_MAX_STDERR_CHARS],
-            )
-        # Only Git actually saying "not a repository" means that. Every other non-zero
-        # exit -- dubious ownership, a permission error, a broken `core.repositoryformat-
-        # version`, a corrupt config -- means we could not tell, and classifying those as
-        # "not a repository" is a fail-open that callers then trust: `awayctl init`'s
-        # location guard passes on NotAGitRepositoryError, so a repository able to make
-        # rev-parse fail could have the ledger created inside itself.
-        if "not a git repository" in stderr.lower():
-            raise NotAGitRepositoryError(
-                "path is not inside a Git working tree",
-                path=str(path),
-                stderr=stderr[:_MAX_STDERR_CHARS],
-            )
-        raise GitCommandError(
-            list(inside.args),
-            inside.returncode,
-            stderr[:_MAX_STDERR_CHARS],
-            cwd=str(path),
-        )
-    # Bare is checked *before* "not a working tree", because a bare repository answers
-    # `false` to both questions and would otherwise get the vaguer of the two messages.
-    # That is what happened until a test stopped matching on `str(exception)` -- which
-    # includes the path, and the fixture's path happened to contain the word "bare".
-    if runner.text("rev-parse", "--is-bare-repository", check=False) == "true":
-        raise UnsupportedRepositoryError(
-            "bare repositories are not supported: Claude Away needs a working tree to "
-            "inspect and, later, to build in",
-            path=str(path),
-        )
-
-    if inside.stdout.decode().strip() != "true":
-        raise UnsupportedRepositoryError(
-            "path is inside a Git directory but not a working tree", path=str(path)
-        )
-
-    # Before `status`, which is the first command that could fire a repository-defined
-    # filter driver. `rev-parse` above reads no worktree content and triggers nothing.
-    _assert_configuration_is_inert(runner, path)
-
-    root = runner.path("rev-parse", "--show-toplevel").resolve()
-    git_dir = runner.path("rev-parse", "--absolute-git-dir")
-    # `--git-common-dir` may come back relative (".git") depending on the Git version, so
-    # it is anchored to the working tree root rather than to the process cwd.
-    common_dir = runner.path("rev-parse", "--git-common-dir")
-    if not common_dir.is_absolute():
-        common_dir = (root / common_dir).resolve()
-    common_dir = common_dir.resolve()
-
-    head = runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
-    head_commit = head.stdout.decode().strip() if head.returncode == 0 else None
+    ``path`` must be the repository root. Earlier builds asked ``git rev-parse
+    --show-toplevel`` and widened a subdirectory to whatever Git said the root was, which
+    handed the repository a vote on which directory got inspected -- ``core.worktree`` is
+    exactly that vote, and it was the fourth review round's critical. The layout now comes
+    from the filesystem, so a path that is not a repository root is refused rather than
+    silently reinterpreted. Enrolment already refuses subdirectories for the same reason.
+    """
+    layout = discover_layout(path)
+    subtree = _inspect_subtree(
+        layout, timeout=timeout, depth=0, visited=frozenset(), budget=_WalkBudget()
+    )
+    runner = GitRunner(layout.worktree, timeout=timeout, layout=layout)
 
     symbolic = runner.run("symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     branch = (
@@ -1001,36 +1073,16 @@ def inspect_repository(
         else None
     )
     # An unborn HEAD is symbolic but has no commit; that is not detachment.
-    is_detached = branch is None and head_commit is not None
+    is_detached = branch is None and subtree.head_commit is not None
 
-    status_output = runner.run(
-        "status",
-        "--porcelain=v2",
-        "-z",
-        "--untracked-files=all",
-        "--ignore-submodules=none",
-    ).stdout
-
-    # Submodules are inspected directly rather than trusted through the parent's descent:
-    # their own status can be told to stay silent, in two ways the superproject cannot see.
-    extra_unverifiable, extra_dirty = _submodule_dirtiness(runner, root)
-    status = _parse_porcelain_v2(
-        status_output,
-        unverifiable=_unverifiable_paths(runner) + extra_unverifiable,
+    # The walker collected each repository separately, so the top-level view is assembled
+    # here rather than read off one porcelain: submodule entries come from the children's
+    # own inspections, and nested unverifiable paths arrive already path-prefixed.
+    status = replace(
+        subtree.status,
+        submodules=subtree.descendants,
+        unverifiable=subtree.status.unverifiable + subtree.nested_unverifiable,
     )
-    if extra_dirty:
-        known = {module.path for module in status.submodules}
-        status = replace(
-            status,
-            submodules=status.submodules
-            + tuple(
-                SubmoduleState(
-                    path=path_, commit_changed=False, has_modifications=True, has_untracked=False
-                )
-                for path_ in extra_dirty
-                if path_ not in known
-            ),
-        )
 
     remotes = tuple(
         line for line in runner.text("remote", check=False).splitlines() if line.strip()
@@ -1041,14 +1093,14 @@ def inspect_repository(
     )
 
     return RepositoryInspection(
-        root=root,
-        git_dir=git_dir,
-        common_dir=common_dir,
-        head_commit=head_commit,
+        root=layout.worktree,
+        git_dir=layout.git_dir,
+        common_dir=layout.common_dir,
+        head_commit=subtree.head_commit,
         branch=branch,
         is_detached=is_detached,
         status=status,
-        operations_in_progress=_operations_in_progress(git_dir),
+        operations_in_progress=_operations_in_progress(layout.git_dir),
         default_branch=default_branch,
         default_branch_source=default_branch_source,
         discovered_default_branch=discovered_default_branch,
@@ -1065,7 +1117,11 @@ def resolve_local_ref(path: Path, ref: str, *, timeout: int = GIT_TIMEOUT_SECOND
     if not is_safe_ref(ref):
         raise GitOutputError("refusing to resolve an unsafe ref name", ref=ref)
 
-    runner = GitRunner(path, timeout=timeout)
+    # Bound like every other invocation. `rev-parse` on a ref reads the ref store rather
+    # than the working tree, so this is not the round-four hole -- but "every invocation is
+    # bound" is only a boundary if it has no exceptions, and an exception here is one more
+    # place a later change could reintroduce discovery without anybody noticing.
+    runner = GitRunner(path, timeout=timeout, layout=discover_layout(path))
     # `--` ends option parsing; `^{commit}` forces a commit, so an annotated tag resolves
     # to the commit rather than the tag object.
     completed = runner.run(

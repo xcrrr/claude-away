@@ -143,39 +143,142 @@ also accept `--config <path>`).
 **Deliberate decisions worth knowing about.**
 
 *Subdirectory enrolment is refused.* Enrolling `repo/src` does not enrol `repo`. Accepting
-it would grant authority over everything beside the directory the user actually named.
+it would grant authority over everything beside the directory the user actually named. The
+refusal is now decided by the filesystem rather than by comparing against
+`git rev-parse --show-toplevel` — see the trust boundary below for why that comparison was
+itself unsafe.
 
-*A repository's own Git configuration is not trusted.* This is the sharpest edge in M2A and
-it was found by review, not by design. Several Git configuration keys hold *commands Git
-executes*, and `git status` alone is enough to fire them: `core.fsmonitor` runs on every
-invocation, and a `filter.<driver>.clean` runs whenever a tracked file's content has to be
-examined. Since `.git/config` is a file inside the repository -- and from M2B a file Claude
-itself can write -- honouring those keys would mean the deterministic controller executing
-code chosen by the thing it supervises. The forged-cleanliness half is worse than the
-execution half: an `fsmonitor` hook decides what Git believes changed, so a hostile one
-makes a modified worktree report clean and defeats the base-revision guard entirely.
+## The Git trust boundary
 
-Two defences. Command-bearing keys with fixed names are pinned via `-c` on every invocation,
-which outranks every configuration file. Keys whose middle component is user-chosen cannot
-be pinned, so they are audited and a repository that sets one *in its own config* is
-refused. The operator's global configuration is trusted -- `git lfs install` writes its
-filters there, and refusing every LFS repository would be a bug rather than a safeguard.
+This is the sharpest edge in M2A, it was found by review rather than by design, and it took
+five attempts. The section is long because the four failed attempts are the argument for the
+shape of the fifth.
 
-**The audit is recursive, and finding that out cost a second review round.** The first
-version audited one repository. But `git status --ignore-submodules=none` spawns a child
-`git status` inside every gitlinked submodule, and that child reads the *submodule's* own
-`.git/config` — which the audit never looked at. A repository could therefore put
-`filter.<driver>.clean` one directory down and have the controller run it, while the `-c`
-pins, which *do* propagate into the child, made the other half of the defence look like it
-was working. The masking half landed too: a clean filter defines what Git compares the
-worktree against, so a driver emitting the pristine blob made a genuinely modified submodule
-report clean and `awayctl repos` printed `ready=1/1`.
+**What is trusted, and what is not.**
 
-The general lesson is worth more than the fix: a defence built on "audit every config file
-Git will read" is only as good as your enumeration of which files those are, and `git
-status` reads more of them than it looks like. A submodule whose config cannot be read is
-refused rather than skipped, for the same reason the audit refuses when it cannot run at
-all.
+| Thing | Trusted? | Why |
+| --- | --- | --- |
+| The enrolled path | Yes | The operator typed it. It is the only statement about this repository that did not come from inside it. |
+| The operator's global and system Git configuration | Yes | `git lfs install` writes `filter.lfs.*` there. Refusing every LFS repository would be a bug wearing a safeguard's clothes. |
+| `.git/config`, `config.worktree`, and every submodule's equivalent | **No** | Files inside the repository. From M2B they are files Claude itself can write, and today they arrive with any clone, archive, or pull request. |
+| Tracked content, including `.gitmodules` and `.gitattributes` | **No** | Arrives through an ordinary commit. Needs no access to `.git` at all. |
+| Git's own answers about the repository's shape (`rev-parse --show-toplevel`, `--absolute-git-dir`) | **No** | They are computed *from* the untrusted configuration. This is the part that took four rounds to accept. |
+| The process boundary | Out of scope | Inspection runs as the operator, in the operator's filesystem namespace. See "residual risk" below. |
+
+**Why it matters more than ordinary code execution.** Several configuration keys hold
+commands Git executes, and `git status` alone fires them: `core.fsmonitor` runs on every
+invocation, and `filter.<driver>.clean` runs whenever a tracked file's content is examined.
+The execution is bad. The *masking* is worse: an `fsmonitor` hook decides what Git believes
+changed and a clean filter decides what Git compares against, so a hostile one makes a
+modified worktree report clean — which defeats `core/base_revision.py` entirely, and
+`awayctl repos` prints `ready=1/1` over somebody else's uncommitted work.
+
+**Four rounds, one shape.** Every round found a critical in the previous round's fix, and
+every one was the same defect: repository-controlled configuration changed what the
+controller executed or believed.
+
+1. `core.fsmonitor` executed during a "read-only" inspection.
+2. The audit stopped at the superproject, so a filter driver one directory down executed
+   anyway — `git status --ignore-submodules=none` spawns a child status in every gitlinked
+   submodule, and that child reads the submodule's own config.
+3. `core.worktree` moved `rev-parse --show-toplevel`, which the recursion used to decide
+   whether a gitlinked path was a separate repository. Pointing it at a decoy made the skip
+   fire, the audit never ran, and Git descended and ran the filter regardless.
+4. `core.worktree` again, this time redirecting *what got inspected*. The audit read the
+   real submodule's config and cleared it; `git status` reported on the decoy. Reproduced
+   directly: `is_clean=True`, `dirty_submodules=[]`, while `super/mod/a.txt` on disk read
+   `SOMEONE ELSE'S UNCOMMITTED WORK`.
+
+The lesson is not that a key was missed. A deny-list over Git's configuration space cannot
+be completed by inspection — Git has hundreds of keys and adds more each release — and
+`core.worktree` is not even command-bearing: `git submodule add` writes it legitimately, so
+"refuse anything that names a command" would never have caught rounds three or four.
+
+**Three controls replace the deny-list, and all three are required.**
+
+1. **Layout comes from the filesystem.** `adapters/gitlayout.py::discover_layout` reads
+   `.git` directly — directory, `gitdir:` pointer file, `commondir` — and starts no Git
+   process at all, because `git rev-parse` is exactly where `core.worktree` gets a vote. It
+   handles the four real shapes (plain `git init`, clone, `--separate-git-dir`, linked
+   worktree) and refuses ambiguity rather than guessing. `inspect_repository` consequently
+   requires a repository *root*: a subdirectory is refused outright instead of being widened
+   through Git. `core/enrolment.py` re-diagnoses that case from the filesystem so the
+   operator still gets "this is a subdirectory, enrol the root" rather than "not a
+   repository".
+2. **Repository-local configuration is default-deny.** `audit_local_config` parses
+   `.git/config` — and `config.worktree` when `extensions.worktreeConfig` is set — with
+   `git config --file <path> --no-includes --list -z`, which performs no repository
+   discovery and loads no effective configuration, so the parse itself cannot be steered.
+   Every key is checked against a small allow-list of what a normal repository needs;
+   anything else is refused, which is what makes the *next* key Git invents safe before
+   anybody hears about it. Values that decide identity are validated rather than merely
+   allowed: `core.bare`, `core.repositoryformatversion`, and `core.worktree` — which must
+   resolve to the enrolled tree, the legitimate submodule case, and is refused when it
+   points anywhere else. Include directives are refused rather than followed, because an
+   include is a way to add configuration the audit would never see.
+3. **Every invocation is bound, and recursion is explicit.** `GitRunner` passes
+   `--git-dir` and `--work-tree` from the validated layout, so no configuration value,
+   working directory, or enclosing repository can change which tree is inspected. Each
+   repository's own status runs with `--ignore-submodules=all`, so Git never chooses to
+   descend; submodules are enumerated from the index (`git ls-files -s`, the authoritative
+   record — `.gitmodules` is rewritable tracked content) and each initialised child goes
+   through the same five steps: discover layout, audit config, bind a runner, run status,
+   recurse. One walker does configuration validation *and* dirtiness collection, because
+   keeping them apart is precisely what produced rounds two and four.
+
+**Consequences of walking rather than descending.** The signals `--ignore-submodules=none`
+used to provide are reconstructed from each child's own inspection, which is strictly more
+information: the child's HEAD is compared against the gitlink OID recorded in the parent's
+index, and assume-unchanged and skip-worktree paths are collected at every level — something
+no parent porcelain has ever reported. `submodule.<name>.ignore` and `.gitmodules`'
+`ignore = all` are no longer overridden; they are simply never consulted, because nothing
+asks Git to descend. Nested paths are prefixed so a refusal or a dirty report names *where*.
+
+`--ignore-submodules=all` stops Git spawning a child status, but it does **not** stop Git
+reading a submodule's configuration file — an unparseable one aborts the parent's status
+with exit 128. So a repository's own status is the last step of its walk rather than the
+first: by the time it runs, every configuration file it will touch has been through the
+allow-list.
+
+**Fail-closed rules.** A check that did not run is never a pass. A submodule whose
+configuration cannot be read is refused, not skipped. Nesting deeper than the walker will
+follow is refused, not truncated — a bound that silently stops checking is a bypass with a
+limit constant next to it. A gitlink resolving outside its own superproject, or onto a git
+directory already being walked, is refused. A Git too old to report configuration scopes is
+refused rather than accepted with the check quietly returning "found nothing".
+
+The walk carries a flat budget as well as a depth cap, because the depth cap alone does not
+bound it: the repository chooses how many gitlinks each level holds, and the same subtree can
+be gitlinked from many paths, so `breadth ** depth` repositories is a shape the repository
+can pick and none of those paths is a cycle. Exceeding the budget is a refusal, for the same
+reason as the depth cap.
+
+**Refusals never print values.** A configuration file can hold credentials —
+`remote.<name>.url` routinely does — and a security refusal that prints what it refused is a
+new problem rather than a fix. Refusals name keys and paths only, and an included file's
+contents never reach diagnostics at all, because includes are refused before they are read.
+
+**Honest scope note on `remote.<name>.uploadpack`.** The allow-list refuses it, as
+unsupported repository-controlled behaviour. It is *not* a confirmed current exploit: in the
+direct reproduction against M2A's command set it did not execute, because nothing in M2A
+contacts a remote. It is listed here so the record does not overstate what was demonstrated.
+
+**Residual risk.** These controls constrain what Git is told to do; they are not a sandbox.
+Inspection still runs as the operator, with the operator's filesystem access and the
+operator's global Git configuration — which is trusted by design, and which a compromised
+developer machine could carry a hostile filter driver in. Symlinks inside a working tree are
+followed by Git as Git normally follows them. If a future review confirms another critical
+of this same family — repository-controlled configuration redirecting execution or belief —
+the answer is not another allow-list entry: it is a hermetic execution boundary (a separate
+process with its own `HOME` and a read-only bind mount, or an equivalent), and M2A should
+not merge until that exists.
+
+**What is pinned against regression.** `tests/integration/test_git_layout_boundary.py`
+covers redirection at the top level and inside a submodule, two-level nesting through four
+different hiding routes, default-deny polarity, include refusal, secret-free diagnostics, and
+— just as important — that plain `git init`, a clone, `--separate-git-dir`, a linked
+worktree, `extensions.worktreeConfig`, an ordinary submodule, and ordinary local settings all
+still work. Nine mutations of the guards were applied and each was observed to fail the suite.
 
 *The default branch is never guessed, and it says where it came from.* Configuration, then
 `refs/remotes/origin/HEAD`, then `None`. There is no fallback to "main" because guessing the

@@ -34,6 +34,7 @@ from claude_away.errors import (
     DuplicateEnrolmentError,
     EnrolmentError,
     GitError,
+    NotAGitRepositoryError,
     NotEnrolledError,
     UnsafeStateLocationError,
 )
@@ -273,6 +274,20 @@ class Enrolment:
         return {"repositories": [r.to_dict() for r in self.repositories]}
 
 
+def _enclosing_repository_root(path: Path) -> Path | None:
+    """The nearest ancestor that holds a ``.git`` entry, or ``None``.
+
+    A pure filesystem walk. Asking Git would mean asking a repository where it thinks its
+    own root is, which is the vote this whole boundary exists to withdraw; here the answer
+    is only used to phrase a refusal, but a diagnostic the repository can steer is a
+    diagnostic that misdirects the operator.
+    """
+    for parent in path.parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
 def _enrol_one(
     project: Mapping[str, Any], *, base_dir: Path, inspector: Any
 ) -> tuple[EnrolledRepository, RepositoryInspection]:
@@ -310,12 +325,28 @@ def _enrol_one(
         )
 
     # Raises NotAGitRepositoryError / UnsupportedRepositoryError (bare) as appropriate.
-    inspection = inspector(resolved, configured_default_branch=project.get("defaultBranch"))
+    try:
+        inspection = inspector(resolved, configured_default_branch=project.get("defaultBranch"))
+    except NotAGitRepositoryError as exc:
+        # The Git adapter refuses any path that is not a repository root, because resolving
+        # the root through Git would let the repository's own `core.worktree` choose it. That
+        # refusal is correct but says only "not a repository", so the far more likely cause
+        # is diagnosed here -- from the filesystem, never from Git -- and named.
+        enclosing = _enclosing_repository_root(resolved)
+        if enclosing is None:
+            raise
+        raise EnrolmentError(
+            "configured path is a subdirectory of a repository, not its root; enrol the "
+            "repository root explicitly if that is what you meant",
+            project_id=project_id,
+            configured_path=str(resolved),
+            repository_root=str(enclosing),
+        ) from exc
 
     if inspection.root != resolved:
-        # The configured path is inside a repository rather than being its root. Accepting
-        # it would silently enrol the parent -- a scope the user never named, and possibly
-        # a much larger one than they intended.
+        # Defence in depth: the adapter now returns the enrolled path itself, so this cannot
+        # fire. It stays because the alternative to noticing a mismatch is enrolling a scope
+        # the user never named.
         raise EnrolmentError(
             "configured path is a subdirectory of a repository, not its root; enrol the "
             "repository root explicitly if that is what you meant",

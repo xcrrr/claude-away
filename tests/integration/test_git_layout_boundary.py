@@ -1,0 +1,607 @@
+"""The hermetic Git boundary: layout discovered from the filesystem, config default-deny.
+
+Four review rounds each found a critical in the previous round's fix, and every one was the
+same shape: a repository-controlled configuration key changed what the controller executed
+or believed. The last two were the same key, ``core.worktree``, exploited two different ways.
+Enumerating dangerous keys cannot be completed by inspection -- Git has hundreds and adds
+more -- so this module tests the replacement:
+
+1. the repository's layout is discovered from the *filesystem*, never from
+   ``git rev-parse``, because that is precisely where ``core.worktree`` gets a vote;
+2. repository-local configuration is validated against a small allow-list, default-deny, so
+   an unknown key is refused rather than waved through;
+3. every Git invocation is bound with explicit ``--git-dir`` and ``--work-tree``, so no
+   configuration value can redirect what is inspected;
+4. submodules are traversed manually by one shared recursive walker, so nested dirtiness
+   cannot hide behind a parent that looks clean.
+
+These tests were written before the implementation and observed failing against
+``ea54c24``.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from claude_away.adapters.git import GitRunner, inspect_repository
+from claude_away.adapters.gitlayout import audit_local_config, discover_layout
+from claude_away.errors import UnsafeRepositoryConfigError, UnsupportedRepositoryError
+from tests.gitfixtures import make_repo
+
+
+def git(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+
+
+def submodule(parent: Path, child_source: Path, name: str) -> Path:
+    git(
+        "-C",
+        str(parent),
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(child_source),
+        name,
+    )
+    git("-C", str(parent), "commit", "-q", "-m", f"add {name}")
+    return parent / name
+
+
+class TestWorktreeRedirection:
+    """``core.worktree`` must never choose what gets inspected."""
+
+    def test_top_level_redirection_cannot_report_a_decoy_clean(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.write("a.txt", "pristine\n")
+        repo.commit_all("init")
+
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+        (decoy / "a.txt").write_text("pristine\n", encoding="utf-8")
+
+        repo.git("config", "core.worktree", str(decoy))
+        (repo.path / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
+
+        try:
+            status = inspect_repository(repo.path).status
+        except (UnsafeRepositoryConfigError, UnsupportedRepositoryError):
+            return  # refusing before status is an equally correct answer
+        assert not status.is_clean, "the decoy tree was inspected instead of the enrolled one"
+
+    def test_submodule_redirection_cannot_hide_uncommitted_work(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "pristine\n")
+        source.commit_all("inner")
+
+        super_repo = make_repo(tmp_path / "super")
+        super_repo.write("t.txt", "t")
+        super_repo.commit_all("init")
+        child = submodule(super_repo.path, source.path, "mod")
+
+        # The decoy must live INSIDE a repository, or the audit already fails closed on it
+        # for an unrelated reason and the test proves nothing. A gitignored directory in the
+        # superproject satisfies that, which is what makes the attack self-contained.
+        decoy = super_repo.path / ".cache"
+        decoy.mkdir()
+        (decoy / "a.txt").write_text("pristine\n", encoding="utf-8")
+        super_repo.write(".gitignore", "/.cache/\n")
+        super_repo.git("add", "-A")
+        super_repo.git("commit", "-q", "-m", "ignore cache")
+        git(
+            f"--git-dir={super_repo.path / '.git' / 'modules' / 'mod'}",
+            "config",
+            "core.worktree",
+            str(decoy),
+        )
+        (child / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
+
+        try:
+            status = inspect_repository(super_repo.path).status
+        except (UnsafeRepositoryConfigError, UnsupportedRepositoryError):
+            return
+        assert not status.is_clean, "the submodule's decoy was inspected"
+        assert "mod" in [module.path for module in status.dirty_submodules]
+
+
+class TestNestedSubmodules:
+    """Nested dirtiness must not disappear because its parent looks clean."""
+
+    def _chain(self, tmp_path: Path) -> tuple[Path, Path]:
+        deep_src = make_repo(tmp_path / "deepsrc")
+        deep_src.write("d.txt", "pristine\n")
+        deep_src.commit_all("deep")
+
+        mid_src = make_repo(tmp_path / "midsrc")
+        mid_src.write("m.txt", "m")
+        mid_src.commit_all("mid")
+        submodule(mid_src.path, deep_src.path, "deep")
+
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("top")
+        mid = submodule(top.path, mid_src.path, "mid")
+        git(
+            "-C",
+            str(mid),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        )
+        return top.path, mid / "deep"
+
+    def test_modified_tracked_file_two_levels_down(self, tmp_path: Path) -> None:
+        top, deep = self._chain(tmp_path)
+        (deep / "d.txt").write_text("CHANGED\n", encoding="utf-8")
+        assert not inspect_repository(top).status.is_clean
+
+    def test_untracked_file_two_levels_down(self, tmp_path: Path) -> None:
+        top, deep = self._chain(tmp_path)
+        (deep / "left-behind.txt").write_text("x", encoding="utf-8")
+        assert not inspect_repository(top).status.is_clean
+
+    def test_assume_unchanged_two_levels_down(self, tmp_path: Path) -> None:
+        top, deep = self._chain(tmp_path)
+        (deep / "d.txt").write_text("CHANGED\n", encoding="utf-8")
+        git("-C", str(deep), "update-index", "--assume-unchanged", "d.txt")
+        assert not inspect_repository(top).status.is_clean
+
+    def test_ignore_all_two_levels_down(self, tmp_path: Path) -> None:
+        """``ignore = all`` is set in ``mid``'s own config, not in its ``.gitmodules``.
+
+        Rewriting the tracked ``.gitmodules`` would make ``mid`` dirty by itself, so the
+        assertion would hold even if the walker never reached ``deep`` -- a test that proves
+        nothing. The config route changes no tracked content, so the only thing that can
+        make this tree report dirty is the nested traversal.
+        """
+        top, deep = self._chain(tmp_path)
+        (deep / "d.txt").write_text("CHANGED\n", encoding="utf-8")
+        git("-C", str(deep.parent), "config", "submodule.deep.ignore", "all")
+
+        quiet = subprocess.run(
+            ["git", "-C", str(top), "status", "--porcelain=v2", "--ignore-submodules=none"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        ).stdout
+        assert "mid" not in quiet, "fixture did not actually suppress reporting"
+
+        assert not inspect_repository(top).status.is_clean
+
+    def test_a_refused_config_two_levels_down_refuses_the_whole_tree(self, tmp_path: Path) -> None:
+        top, deep = self._chain(tmp_path)
+        git("-C", str(deep), "config", "filter.pwn.clean", "/bin/true")
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(top)
+
+
+class TestDefaultDenyLocalConfig:
+    def test_an_unknown_local_key_is_refused(self, tmp_path: Path) -> None:
+        """Proves the polarity really is default-deny rather than a longer deny-list."""
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "futureClaudeAwayTest.someKey", "value")
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert any("futureclaudeawaytest" in key.lower() for key in caught.value.details["keys"])
+
+    def test_the_refusal_does_not_print_the_value(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "futureClaudeAwayTest.token", "SUPERSECRETVALUE")
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert "SUPERSECRETVALUE" not in str(caught.value.to_dict())
+
+    @pytest.mark.parametrize("directive", ["include.path", "includeIf.gitdir:/.path"])
+    def test_local_includes_are_refused(self, tmp_path: Path, directive: str) -> None:
+        """An include is a way to add config the audit never sees."""
+        extra = tmp_path / "extra.cfg"
+        extra.write_text('[filter "pwn"]\n\tclean = /bin/true\n', encoding="utf-8")
+
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", directive, str(extra))
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(repo.path)
+
+    def test_an_included_secret_never_reaches_diagnostics(self, tmp_path: Path) -> None:
+        extra = tmp_path / "extra.cfg"
+        extra.write_text("[secretsection]\n\ttoken = INCLUDEDSECRET\n", encoding="utf-8")
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "include.path", str(extra))
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert "INCLUDEDSECRET" not in str(caught.value.to_dict())
+
+    def test_remote_uploadpack_is_refused(self, tmp_path: Path) -> None:
+        """Rejected as unsupported repository-controlled behaviour.
+
+        Honest scope note: this did NOT execute in the reproduction against M2A's command
+        set, because nothing here contacts a remote. It is refused because the allow-list
+        is default-deny, not because a current exploit was demonstrated.
+        """
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "remote.origin.uploadpack", "/bin/true")
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(repo.path)
+
+
+class TestOrdinaryRepositoriesStillWork:
+    """Safety may refuse the unusual. It must not refuse every normal clone."""
+
+    def test_git_init(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "plain")
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_a_normal_clone(self, tmp_path: Path) -> None:
+        origin = make_repo(tmp_path / "origin")
+        origin.write("a.txt", "x")
+        origin.commit_all("first")
+        clone = tmp_path / "clone"
+        git("clone", "-q", str(origin.path), str(clone))
+        assert inspect_repository(clone).status.is_clean
+
+    def test_separate_git_dir(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        store = tmp_path / "store"
+        git("init", "-q", f"--separate-git-dir={store}", str(worktree))
+        git("-C", str(worktree), "config", "user.email", "a@b")
+        git("-C", str(worktree), "config", "user.name", "a")
+        (worktree / "a.txt").write_text("x", encoding="utf-8")
+        git("-C", str(worktree), "add", "-A")
+        git("-C", str(worktree), "commit", "-q", "-m", "i")
+        assert inspect_repository(worktree).status.is_clean
+
+    def test_a_linked_worktree(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "main")
+        repo.write("a.txt", "x")
+        repo.commit_all("i")
+        linked = tmp_path / "linked"
+        repo.git("worktree", "add", "-q", str(linked), "-b", "side")
+        assert inspect_repository(linked).status.is_clean
+
+    def test_extensions_worktree_config(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "extensions.worktreeConfig", "true")
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_an_initialised_submodule(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+        super_repo = make_repo(tmp_path / "super")
+        super_repo.write("t.txt", "t")
+        super_repo.commit_all("init")
+        submodule(super_repo.path, source.path, "mod")
+        assert inspect_repository(super_repo.path).status.is_clean
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("user.name", "A Developer"),
+            ("user.email", "dev@example.invalid"),
+            ("core.filemode", "false"),
+            ("core.ignorecase", "true"),
+            ("core.precomposeunicode", "true"),
+            ("core.autocrlf", "input"),
+            ("core.symlinks", "true"),
+            ("core.logallrefupdates", "true"),
+        ],
+    )
+    def test_ordinary_local_settings_are_accepted(
+        self, tmp_path: Path, key: str, value: str
+    ) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", key, value)
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_remote_and_branch_tracking_metadata(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "remote.origin.url", "https://example.invalid/x.git")
+        repo.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        repo.git("config", "branch.main.remote", "origin")
+        repo.git("config", "branch.main.merge", "refs/heads/main")
+        assert inspect_repository(repo.path).status.is_clean
+
+
+class TestEveryInvocationIsBound:
+    """Control 3 on its own, with the allow-list deliberately out of the way.
+
+    Every one of these was written because a mutation of the guard survived the suite. The
+    allow-list refuses a hostile ``core.worktree`` before the runner ever sees it, so a test
+    that goes through ``inspect_repository`` cannot tell a bound runner from an unbound one.
+    These drive the runner directly, or inspect the argv, so each control is pinned by
+    itself rather than by the one in front of it.
+    """
+
+    def test_a_bound_runner_ignores_core_worktree(self, tmp_path: Path) -> None:
+        """Kills: dropping ``--work-tree`` from the location arguments.
+
+        ``core.worktree`` is set and *not* audited here. With the binding in place Git
+        reports the enrolled tree's modification; without it, Git honours the value and
+        describes the decoy, which is round four exactly.
+        """
+        repo = make_repo(tmp_path / "repo")
+        repo.write("a.txt", "pristine\n")
+        repo.commit_all("init")
+
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+        (decoy / "a.txt").write_text("pristine\n", encoding="utf-8")
+
+        layout = discover_layout(repo.path)
+        repo.git("config", "core.worktree", str(decoy))
+        (repo.path / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
+
+        output = (
+            GitRunner(repo.path, layout=layout)
+            .run(
+                "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=all"
+            )
+            .stdout
+        )
+        assert b"a.txt" in output, "the decoy tree was described instead of the enrolled one"
+
+    def _record(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+        import subprocess as subprocess_module
+
+        seen: list[list[str]] = []
+        real_run = subprocess_module.run
+
+        def recording_run(argv: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr("claude_away.adapters.git.subprocess.run", recording_run)
+        return seen
+
+    def _superproject(self, tmp_path: Path) -> Path:
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+        super_repo = make_repo(tmp_path / "super")
+        super_repo.write("t.txt", "t")
+        super_repo.commit_all("init")
+        submodule(super_repo.path, source.path, "mod")
+        return super_repo.path
+
+    def test_every_invocation_names_a_git_dir_and_a_work_tree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Kills: dropping either location argument.
+
+        ``--work-tree`` has a behavioural discriminator above. ``--git-dir`` does not have
+        one for the current command set -- ``-C`` at a validated root finds the same git
+        directory -- so it is pinned as a contract instead. That is the honest position:
+        it is defence in depth, and a defence nothing checks is a defence that quietly
+        disappears in the next refactor.
+        """
+        root = self._superproject(tmp_path)
+        seen = self._record(monkeypatch)
+        inspect_repository(root)
+
+        # `git config --file <path> --no-includes` is the inert parse: it binds to one file,
+        # starts no repository discovery, and deliberately predates the layout being trusted.
+        # Everything else goes through `GitRunner`, which is what `--no-optional-locks` marks.
+        runner_calls = [argv for argv in seen if "--no-optional-locks" in argv]
+        assert runner_calls, "no GitRunner invocations were recorded"
+        for argv in seen:
+            if argv not in runner_calls:
+                assert argv[:3] == ["git", "config", "--file"], argv
+                continue
+            assert any(a.startswith("--git-dir=") for a in argv), argv
+            assert any(a.startswith("--work-tree=") for a in argv), argv
+        seen = runner_calls
+
+        # And both repositories in the tree were reached explicitly, not through a descent.
+        bound = {a for argv in seen for a in argv if a.startswith("--work-tree=")}
+        assert bound == {f"--work-tree={root}", f"--work-tree={root / 'mod'}"}
+
+    def test_git_is_never_asked_to_descend_into_a_submodule(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Kills: switching the status command back to ``--ignore-submodules=none``.
+
+        ``=none`` makes Git spawn a status inside each submodule, using Git's own idea of
+        where that submodule's working tree is. Nothing must ask for that: each repository
+        is reached through the walker, which validates it first.
+        """
+        root = self._superproject(tmp_path)
+        seen = self._record(monkeypatch)
+        inspect_repository(root)
+
+        statuses = [argv for argv in seen if "status" in argv]
+        assert statuses, "no status invocation was recorded"
+        for argv in statuses:
+            assert "--ignore-submodules=all" in argv, argv
+            assert "--ignore-submodules=none" not in argv, argv
+
+
+class TestTheAuditReadsWhatItClaimsTo:
+    """More survivors of the mutation run, each pinned by the property it actually protects."""
+
+    def test_a_worktree_scoped_unknown_key_is_refused(self, tmp_path: Path) -> None:
+        """Kills: skipping ``config.worktree``.
+
+        The existing worktree-scope test uses a *command-bearing* key, which the
+        defence-in-depth scope audit catches on its own -- so the allow-list could stop
+        reading ``config.worktree`` entirely with the suite green. An inert unknown key is
+        visible only to the allow-list.
+        """
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "extensions.worktreeConfig", "true")
+        repo.git("config", "--worktree", "futureClaudeAwayTest.someKey", "value")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert any("futureclaudeawaytest" in key.lower() for key in caught.value.details["keys"])
+
+    def test_a_malformed_included_file_still_produces_a_named_refusal(self, tmp_path: Path) -> None:
+        """The allow-list must name an include without reading, or depending on, its target.
+
+        This does *not* kill the "drop ``--no-includes``" mutation, and the honest reason is
+        that the mutation is equivalent: ``git config --file`` does not expand includes in
+        the first place -- verified directly, with a malformed included file, on this Git.
+        ``--no-includes`` stays as explicit intent and as insurance against that default
+        changing, not because it is load-bearing today.
+
+        Driven against ``audit_local_config`` rather than ``inspect_repository``, because
+        the effective-configuration check that runs first *does* expand includes and dies on
+        the garbage before the allow-list is reached.
+        """
+        extra = tmp_path / "extra.cfg"
+        extra.write_text("[core\nthis is not valid config\n", encoding="utf-8")
+
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "include.path", str(extra))
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            audit_local_config(discover_layout(repo.path))
+        assert caught.value.details["keys"] == ["include.path"]
+
+    def test_core_worktree_pointing_elsewhere_is_refused_not_merely_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        """Kills: allowing ``core.worktree`` without comparing it to the enrolled tree.
+
+        The binding already means the value cannot take effect, so a redirection test that
+        accepts "reported dirty" as a pass cannot see this guard at all. Refusing is
+        deliberate: a repository that has written a redirection is a repository whose state
+        Claude Away should decline to summarise, whether or not this build happens to be
+        immune to it.
+        """
+        repo = make_repo(tmp_path / "repo")
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+        repo.git("config", "core.worktree", str(decoy))
+
+        with pytest.raises(UnsafeRepositoryConfigError, match=r"core\.worktree"):
+            inspect_repository(repo.path)
+
+    def test_a_submodules_own_core_worktree_is_accepted(self, tmp_path: Path) -> None:
+        """The other half: `git submodule add` writes `core.worktree` legitimately.
+
+        Refusing it would refuse every submodule, which is how a safeguard becomes a bug.
+        """
+        root = TestEveryInvocationIsBound()._superproject(tmp_path)
+        module_config = root / ".git" / "modules" / "mod" / "config"
+        assert "worktree" in module_config.read_text(encoding="utf-8"), (
+            "fixture no longer produces the case under test"
+        )
+        assert inspect_repository(root).status.is_clean
+
+
+class TestTheWalkIsBounded:
+    def test_more_repositories_than_the_budget_is_refused_not_truncated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The depth cap does not bound the walk; the repository chooses the breadth.
+
+        Depth 8 with a wide fan-out is ``breadth ** depth`` repositories, and none of those
+        paths is a cycle, so per-branch cycle detection sees nothing wrong. The flat budget
+        is the bound, and it refuses rather than truncating -- stopping early and reporting
+        ``clean`` would be a verdict about a subtree nobody walked.
+        """
+        from claude_away.adapters import git as git_module
+
+        assert git_module._MAX_INSPECTED_REPOSITORIES >= 64, (
+            "the real budget must leave room for ordinary multi-submodule projects"
+        )
+        # Lowered rather than built out to 257 real submodules: the fixture cost would be
+        # ~30s and would prove nothing the small case does not.
+        monkeypatch.setattr(git_module, "_MAX_INSPECTED_REPOSITORIES", 3)
+
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("init")
+        for index in range(3):
+            submodule(top.path, source.path, f"mod{index}")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(top.path)
+        assert caught.value.details["repository_limit"] == 3
+
+    def test_a_tree_within_the_budget_is_inspected_rather_than_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The bound must not become a blanket refusal of ordinary multi-submodule projects."""
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("init")
+        for index in range(5):
+            submodule(top.path, source.path, f"mod{index}")
+
+        assert inspect_repository(top.path).status.is_clean
+
+
+class TestRealWorldRepositoriesAreNotRefused:
+    """Default-deny is only usable if the "normal" set is genuinely covered."""
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            # husky and friends write this locally in a large share of real projects. It is
+            # allowed only because `core.hooksPath` is pinned to /dev/null on every call.
+            ("core.hooksPath", ".husky/_"),
+            ("commit.gpgsign", "false"),
+            ("core.untrackedCache", "true"),
+            ("lfs.repositoryformatversion", "0"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialclonefilter", "blob:none"),
+            ("submodule.mod.ignore", "all"),
+            ("branch.main.pushRemote", "origin"),
+        ],
+    )
+    def test_an_ordinary_local_key_is_accepted(self, tmp_path: Path, key: str, value: str) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", key, value)
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_a_hooks_path_cannot_actually_fire(self, tmp_path: Path) -> None:
+        """Why allowing `core.hooksPath` is safe: the pin outranks it on every invocation."""
+        repo = make_repo(tmp_path / "repo")
+        marker = tmp_path / "EXECUTED"
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-index-change"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        repo.git("config", "core.hooksPath", str(hooks))
+
+        repo.write("f.txt", "changed\n")
+        inspect_repository(repo.path)
+
+        assert not marker.exists(), "a repository-named hooks directory was consulted"
+
+    def test_a_sha256_style_extension_is_accepted(self, tmp_path: Path) -> None:
+        """`extensions.objectFormat` is v1-only, so the format version has to move with it.
+
+        Parametrising it alongside the v0 keys made Git itself refuse the fixture, which
+        would have hidden whether the allow-list accepts the key at all.
+        """
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "core.repositoryFormatVersion", "1")
+        repo.git("config", "extensions.objectFormat", "sha1")
+        assert inspect_repository(repo.path).status.is_clean
