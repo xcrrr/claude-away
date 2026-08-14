@@ -263,6 +263,51 @@ unsupported repository-controlled behaviour. It is *not* a confirmed current exp
 direct reproduction against M2A's command set it did not execute, because nothing in M2A
 contacts a remote. It is listed here so the record does not overstate what was demonstrated.
 
+## Known unresolved: the allow-list does not close the family, and M2A must not merge
+
+A fifth adversarial round, against the three-control design above, confirmed the same class
+again — this time **inside the allow-list that replaced the deny-list**. These are open. They
+are recorded here rather than patched, because patching them one key at a time is the
+approach that failed four times.
+
+**Confirmed Critical — `core.ignorecase` masks untracked work.** It is on the allow-list,
+because `git init` writes it on macOS and Windows. On a case-sensitive filesystem it makes
+the index name-hash case-insensitive, so an untracked file whose path is a case-variant of
+any tracked path is not reported at all. Reproduced: a repository with `a.txt` and
+`src/lib.py` tracked, plus untracked `A.TXT` and `src/LIB.py` holding arbitrary content,
+reports `is_clean: true` with `untracked: []` after one `git config core.ignorecase true` —
+and the files survive `git checkout -b`. It reproduces at submodule depth too. It violates
+the allow-list's own stated admission rule, and it was admitted by exactly the reasoning
+that admitted `core.worktree`: real tooling writes it. It cannot simply be refused, because
+on a genuinely case-insensitive filesystem the value is correct and necessary, so refusing
+it would refuse every macOS repository. `core.filemode = false` is the same shape, weaker.
+
+**Confirmed High — `.gitattributes` moves the attack out of configuration entirely.** No
+control in this design reads `.gitattributes` or `.git/info/attributes`, and neither needs a
+configuration key. On any machine where `git lfs install` has been run — which puts
+`filter.lfs.*` in the operator's *global* config, the scope this design trusts — a
+repository that commits `* filter=lfs` makes `inspect_repository` spawn `sh -c <driver>`,
+for repository-chosen paths, during what is documented as an inert read. Reproduced with
+`GIT_TRACE` showing five `run_command` spawns. The repository chooses *whether*, *where* and
+with what `%f`; the program body comes from the operator, which is why this is High rather
+than Critical. A lossy global driver would additionally mask real modifications.
+
+**Confirmed Medium — `.git/info/exclude` and a tracked `.gitignore` hide untracked work,**
+reported as `is_clean: true`. Arguably correct Git semantics, but the design refuses
+`core.excludesFile` explicitly as a masking vector while leaving the two default files it
+points to unguarded, so at minimum the position is inconsistent and undocumented.
+
+**The conclusion.** The three controls are a real improvement — they close rounds one
+through four, and eight of nine mutations of them fail the suite. They are still not
+sufficient, and the reason is structural rather than a matter of list maintenance: the
+inputs that decide what `git status` finds are not confined to configuration files, and
+among the configuration keys that do decide it, some are ones ordinary repositories must be
+allowed to set. **M2A should not merge on this basis.** What it needs is a hermetic
+execution boundary — inspection in a separate process with its own `HOME`, its own
+configuration search path, and a read-only view of the repository, so that the answer does
+not depend on enumerating which repository-controlled inputs matter. That is a larger piece
+of work than a milestone gate, and it should be designed rather than bolted on.
+
 **Residual risk.** These controls constrain what Git is told to do; they are not a sandbox.
 Inspection still runs as the operator, with the operator's filesystem access and the
 operator's global Git configuration — which is trusted by design, and which a compromised

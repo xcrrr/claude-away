@@ -416,9 +416,11 @@ class TestEveryInvocationIsBound:
     ) -> None:
         """Kills: switching the status command back to ``--ignore-submodules=none``.
 
-        ``=none`` makes Git spawn a status inside each submodule, using Git's own idea of
-        where that submodule's working tree is. Nothing must ask for that: each repository
-        is reached through the walker, which validates it first.
+        ``=none`` makes Git scan each submodule's *worktree*, using Git's own idea of where
+        that worktree is. Nothing must ask for that: the content half comes from the walker,
+        which validates each repository first. ``=dirty`` is the setting that keeps the
+        gitlink *records* -- a staged bump, a deleted or replaced submodule directory --
+        which ``=all`` suppressed and which the walker cannot reconstruct from the child.
         """
         root = self._superproject(tmp_path)
         seen = self._record(monkeypatch)
@@ -427,7 +429,7 @@ class TestEveryInvocationIsBound:
         statuses = [argv for argv in seen if "status" in argv]
         assert statuses, "no status invocation was recorded"
         for argv in statuses:
-            assert "--ignore-submodules=all" in argv, argv
+            assert "--ignore-submodules=dirty" in argv, argv
             assert "--ignore-submodules=none" not in argv, argv
 
 
@@ -605,3 +607,382 @@ class TestRealWorldRepositoriesAreNotRefused:
         repo.git("config", "core.repositoryFormatVersion", "1")
         repo.git("config", "extensions.objectFormat", "sha1")
         assert inspect_repository(repo.path).status.is_clean
+
+
+class TestPointerFilesAreParsedExactlyAsGitParsesThem:
+    """A pointer parser that disagrees with Git names a git directory Git would never use.
+
+    Found by review of the first version of this module, which used ``.strip()``. Git's
+    ``read_gitfile_gently`` trims only ``\\n`` and ``\\r``, so a git directory whose name ends
+    in a space -- which ``git init --separate-git-dir`` and ``git submodule add`` both
+    produce for such a path -- came back trimmed. With a decoy directory sitting at the
+    trimmed name, every bound invocation was pointed at a different repository and the whole
+    inspection agreed with itself while disagreeing with Git.
+
+    The same mistake had already been made and fixed once in ``GitRunner.path``.
+    """
+
+    def test_a_git_dir_whose_name_ends_in_a_space_is_not_trimmed(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        store = tmp_path / "store "
+        git("init", "-q", f"--separate-git-dir={store}", str(worktree))
+        pointer = (worktree / ".git").read_bytes().rstrip(b"\n")
+        assert pointer.endswith(b" "), f"fixture lost the trailing space: {pointer!r}"
+
+        assert discover_layout(worktree).git_dir == store.resolve()
+
+    def test_a_decoy_at_the_trimmed_name_is_not_inspected(self, tmp_path: Path) -> None:
+        """The exploit the trim enabled, end to end."""
+        worktree = tmp_path / "wt"
+        real = tmp_path / "store "
+        git("init", "-q", f"--separate-git-dir={real}", str(worktree))
+        git("-C", str(worktree), "config", "user.email", "a@b")
+        git("-C", str(worktree), "config", "user.name", "a")
+        (worktree / "a.txt").write_text("x", encoding="utf-8")
+        git("-C", str(worktree), "add", "-A")
+        git("-C", str(worktree), "commit", "-q", "-m", "real")
+
+        decoy = make_repo(tmp_path / "decoysrc")
+        decoy.write("d.txt", "decoy\n")
+        decoy_head = decoy.commit_all("decoy commit")
+        (tmp_path / "store").mkdir()
+        for entry in (decoy.path / ".git").iterdir():
+            entry.rename(tmp_path / "store" / entry.name)
+
+        inspection = inspect_repository(worktree)
+        assert inspection.git_dir == real.resolve()
+        assert inspection.head_commit != decoy_head
+
+    def test_a_submodule_path_ending_in_a_space_still_works(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+        super_repo = make_repo(tmp_path / "super")
+        super_repo.write("t.txt", "t")
+        super_repo.commit_all("init")
+        submodule(super_repo.path, source.path, "sub ")
+
+        assert inspect_repository(super_repo.path).status.is_clean
+
+    def test_a_commondir_ending_in_a_space_is_not_trimmed(self, tmp_path: Path) -> None:
+        """`common_dir` is where `local_config` comes from, so trimming moves the audited file."""
+        host = make_repo(tmp_path / "host")
+        host.write("a.txt", "x")
+        host.commit_all("i")
+        real = tmp_path / "common "
+        (host.path / ".git").rename(real)
+
+        worktree = tmp_path / "wt"
+        (worktree / ".git").mkdir(parents=True)
+        (worktree / ".git" / "HEAD").write_bytes((real / "HEAD").read_bytes())
+        (worktree / ".git" / "commondir").write_bytes(str(real).encode())
+
+        assert discover_layout(worktree).common_dir == real.resolve()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"gitdir:%s",  # no space after the colon
+            b"  gitdir: %s",  # leading whitespace
+            b"not a pointer at all",
+        ],
+    )
+    def test_a_pointer_git_itself_rejects_is_rejected_here(
+        self, tmp_path: Path, content: bytes
+    ) -> None:
+        """More permissive than Git means inspecting trees Git does not call repositories."""
+        host = make_repo(tmp_path / "host")
+        probe = tmp_path / "probe"
+        probe.mkdir()
+        (probe / ".git").write_bytes(content.replace(b"%s", str(host.path / ".git").encode()))
+
+        assert (
+            subprocess.run(
+                ["git", "-C", str(probe), "rev-parse", "--absolute-git-dir"],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            ).returncode
+            != 0
+        ), "fixture is not actually rejected by git, so this proves nothing"
+
+        with pytest.raises(UnsupportedRepositoryError):
+            discover_layout(probe)
+
+
+class TestBareRepositoriesAndTheirWorktrees:
+    def test_a_bare_repository_is_still_refused(self, tmp_path: Path) -> None:
+        bare = tmp_path / "bare.git"
+        git("init", "-q", "--bare", str(bare))
+        with pytest.raises(UnsupportedRepositoryError, match="bare repositories"):
+            inspect_repository(bare)
+
+    def test_a_linked_worktree_of_a_bare_repository_is_not_called_bare(
+        self, tmp_path: Path
+    ) -> None:
+        """`git clone --bare` + `git worktree add` is ordinary, and the tree is real.
+
+        The bare repository's `core.bare = true` is also the *common* config of every linked
+        worktree it hosts, so a check on the value alone refused a working tree with a
+        working `git status` -- and the operator could not fix it without breaking Git.
+        """
+        origin = make_repo(tmp_path / "origin")
+        origin.write("a.txt", "x")
+        origin.commit_all("first")
+        bare = tmp_path / "bare.git"
+        git("clone", "-q", "--bare", str(origin.path), str(bare))
+        linked = tmp_path / "linked"
+        git("-C", str(bare), "worktree", "add", "-q", str(linked), "-b", "work")
+
+        assert inspect_repository(linked).status.is_clean
+
+
+class TestDiagnosticsCarryNoCredentials:
+    def test_a_credential_in_a_key_name_is_redacted(self, tmp_path: Path) -> None:
+        """Values were redacted first; keys were not, and that is where the token usually is.
+
+        `url.<base>.insteadOf` with an embedded token is what `actions/checkout` writes, and
+        none of those keys is on the allow-list -- so a default-deny audit is *guaranteed* to
+        name them in a refusal.
+        """
+        repo = make_repo(tmp_path / "repo")
+        repo.git(
+            "config",
+            "url.https://x-access-token:ghp_SECRETTOKENINKEY@github.com/.insteadOf",
+            "https://github.com/",
+        )
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+
+        rendered = str(caught.value.to_dict())
+        assert "ghp_SECRETTOKENINKEY" not in rendered, rendered
+        assert "<redacted>@github.com" in rendered, rendered
+
+    def test_a_credential_in_a_command_bearing_key_is_redacted_too(self, tmp_path: Path) -> None:
+        """The other refusal path: `credential.<url>.helper` takes a URL subsection as well."""
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "credential.https://u:ghp_OTHERSECRET@example.invalid.helper", "!true")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert "ghp_OTHERSECRET" not in str(caught.value.to_dict())
+
+    def test_the_refusal_names_the_file_to_edit(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "futureClaudeAwayTest.someKey", "value")
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            inspect_repository(repo.path)
+        assert caught.value.details["config"] == str(repo.path / ".git" / "config")
+
+    def test_includes_and_unknown_keys_are_reported_together(self, tmp_path: Path) -> None:
+        """One round trip, not two: fixing the include only to be told about the rest is a
+        second failing unattended run for no reason."""
+        extra = tmp_path / "extra.cfg"
+        extra.write_text("[user]\n\tname = x\n", encoding="utf-8")
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "include.path", str(extra))
+        repo.git("config", "futureClaudeAwayTest.someKey", "value")
+
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
+            audit_local_config(discover_layout(repo.path))
+        keys = [key.lower() for key in caught.value.details["keys"]]
+        assert "include.path" in keys
+        assert "futureclaudeawaytest.somekey" in keys
+
+
+class TestTheAllowListCoversRealProjects:
+    def test_this_projects_own_repository_is_accepted(self) -> None:
+        """The first version of the allow-list refused it, over `gc.auto`.
+
+        A safeguard that refuses the project it ships in is one nobody will leave switched on.
+        """
+        audit_local_config(discover_layout(Path(__file__).resolve().parents[2]))
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("gc.auto", "0"),
+            ("maintenance.auto", "false"),
+            ("maintenance.strategy", "incremental"),
+            ("user.signingKey", "ABCD1234"),
+            ("tag.gpgsign", "true"),
+            ("gpg.format", "ssh"),
+            ("fetch.prune", "true"),
+            ("pull.ff", "only"),
+            ("rebase.autoStash", "true"),
+            ("diff.algorithm", "histogram"),
+            ("merge.conflictStyle", "zdiff3"),
+            ("rerere.enabled", "true"),
+            ("push.followTags", "true"),
+            ("push.autoSetupRemote", "true"),
+            ("feature.manyFiles", "true"),
+            ("index.version", "4"),
+            ("core.commitGraph", "true"),
+            ("core.preloadIndex", "true"),
+            ("checkout.workers", "0"),
+            ("http.postBuffer", "524288000"),
+            ("color.ui", "auto"),
+            ("log.date", "iso"),
+            ("branch.sort", "-committerdate"),
+            ("remote.pushDefault", "origin"),
+            ("remote.origin.gh-resolved", "base"),
+            ("branch.main.vscode-merge-base", "origin/main"),
+            ("gitflow.branch.develop", "develop"),
+            ("gitflow.prefix.feature", "feature/"),
+            ("lfs.url", "https://example.invalid/lfs"),
+        ],
+    )
+    def test_a_key_ordinary_tooling_writes_is_accepted(
+        self, tmp_path: Path, key: str, value: str
+    ) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", key, value)
+        assert inspect_repository(repo.path).status.is_clean
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            # Each of these decides what `git status` finds or what Git executes, so each
+            # stays refused however common it is.
+            ("core.excludesFile", "/dev/null"),
+            ("core.attributesFile", "/dev/null"),
+            ("status.showUntrackedFiles", "no"),
+            ("core.fsmonitor", "/bin/true"),
+            ("init.defaultBranch", "attacker-branch"),
+        ],
+    )
+    def test_a_masking_key_stays_refused(self, tmp_path: Path, key: str, value: str) -> None:
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", key, value)
+        with pytest.raises(UnsafeRepositoryConfigError):
+            inspect_repository(repo.path)
+
+
+class TestGitlinkRecordChangesAreNotSuppressed:
+    """``--ignore-submodules=all`` was a false-clean regression, found by review.
+
+    ``all`` suppresses two different things: the submodule's *worktree* state, which the
+    manual walk reconstructs and improves on, and the gitlink *record* -- the five porcelain
+    shapes ``M.``, ``A.``, ``D.``, ``.D`` and ``.T``. The walk cannot reconstruct the second
+    group from the child, because they are facts about the *parent's* index and worktree, so
+    six ordinary dirty states reported clean while ``git status`` itself printed them.
+    ``dirty`` suppresses exactly the first group.
+
+    Each case below asserts against plain ``git status`` first, so a fixture that stops
+    reproducing the state fails loudly rather than passing vacuously.
+    """
+
+    def _superproject(self, tmp_path: Path) -> tuple[Path, Path]:
+        source = make_repo(tmp_path / "src")
+        source.write("f.txt", "one\n")
+        source.commit_all("one")
+        source.write("f.txt", "two\n")
+        source.commit_all("two")
+
+        top = make_repo(tmp_path / "top")
+        top.write("x.txt", "x")
+        top.commit_all("init")
+        child = submodule(top.path, source.path, "sub")
+        return top.path, child
+
+    def _assert_git_sees_it(self, root: Path, expected: str) -> None:
+        raw = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        ).stdout
+        assert expected in raw, f"fixture no longer produces {expected!r}; git said {raw!r}"
+
+    def test_a_staged_submodule_bump(self, tmp_path: Path) -> None:
+        root, child = self._superproject(tmp_path)
+        git("-C", str(child), "checkout", "-q", "HEAD~1")
+        git("-C", str(root), "add", "sub")
+        self._assert_git_sees_it(root, "M  sub")
+        assert not inspect_repository(root).status.is_clean
+
+    def test_a_staged_gitlink_delete(self, tmp_path: Path) -> None:
+        root, _ = self._superproject(tmp_path)
+        git("-C", str(root), "rm", "-q", "--cached", "sub")
+        import shutil
+
+        shutil.rmtree(root / "sub")
+        self._assert_git_sees_it(root, "D  sub")
+        assert not inspect_repository(root).status.is_clean
+
+    def test_a_deleted_submodule_directory(self, tmp_path: Path) -> None:
+        root, _ = self._superproject(tmp_path)
+        import shutil
+
+        shutil.rmtree(root / "sub")
+        self._assert_git_sees_it(root, " D sub")
+        assert not inspect_repository(root).status.is_clean
+
+    def test_a_submodule_replaced_by_a_file(self, tmp_path: Path) -> None:
+        root, _ = self._superproject(tmp_path)
+        import shutil
+
+        shutil.rmtree(root / "sub")
+        (root / "sub").write_text("not a submodule\n", encoding="utf-8")
+        self._assert_git_sees_it(root, " T sub")
+        assert not inspect_repository(root).status.is_clean
+
+    def test_an_unstaged_submodule_bump_is_still_caught(self, tmp_path: Path) -> None:
+        root, child = self._superproject(tmp_path)
+        git("-C", str(child), "checkout", "-q", "HEAD~1")
+        self._assert_git_sees_it(root, " M sub")
+        assert not inspect_repository(root).status.is_clean
+
+    def test_a_gitlink_whose_repository_was_removed_but_content_left_behind(
+        self, tmp_path: Path
+    ) -> None:
+        """Git's own porcelain says nothing here at any --ignore-submodules setting.
+
+        Deleting ``sub/.git`` after rewriting ``sub/f.txt`` left the tree reporting clean
+        while the swapped content survived ``git checkout -b``. It is reported as
+        unverifiable rather than dirty, because that is the accurate statement: there is no
+        repository there to ask.
+        """
+        root, child = self._superproject(tmp_path)
+        (child / "f.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
+        (child / ".git").unlink()  # a submodule's .git is a gitdir pointer file
+
+        raw = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--ignore-submodules=none"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        ).stdout
+        assert raw.strip() == "", f"git unexpectedly reports this now: {raw!r}"
+
+        status = inspect_repository(root).status
+        assert not status.is_clean
+        assert any(entry.startswith("sub") for entry in status.unverifiable), status.unverifiable
+
+    def test_an_uninitialised_submodule_is_still_clean(self, tmp_path: Path) -> None:
+        """The case the old comment described, and the reason this is not simply "dirty"."""
+        root, child = self._superproject(tmp_path)
+        import shutil
+
+        shutil.rmtree(child)
+        child.mkdir()
+        assert inspect_repository(root).status.is_clean
+
+    def test_a_conflicted_gitlink_is_reported_once(self, tmp_path: Path) -> None:
+        """Stages 1/2/3 are one path, not three submodules to walk."""
+        root, _ = self._superproject(tmp_path)
+        oid = git("-C", str(root), "rev-parse", "HEAD:sub").stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(root), "update-index", "--index-info"],
+            input="".join(f"160000 {oid} {stage}\tsub\n" for stage in (1, 2, 3)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        status = inspect_repository(root).status
+        assert not status.is_clean
+        assert [module.path for module in status.submodules].count("sub") <= 1

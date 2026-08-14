@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 from claude_away import __version__
-from claude_away.adapters.git import inspect_repository
 from claude_away.core.base_revision import resolve_expected_base
 from claude_away.core.dag import blocking_dependencies, find_cycle
 from claude_away.core.db import SCHEMA_VERSION, Database, open_database
@@ -41,7 +40,6 @@ from claude_away.core.validation import validate_config_document
 from claude_away.errors import (
     ClaudeAwayError,
     GitError,
-    NotAGitRepositoryError,
     UnsafeStateLocationError,
     ValidationError,
 )
@@ -128,12 +126,20 @@ def _assert_db_outside_a_repository(path: Path) -> None:
     Checked against any repository, not just enrolled ones: at ``init`` time there is no
     configuration to consult, and "inside some repository" is the property that matters.
 
-    Only ``NotAGitRepositoryError`` means "not a repository". Every other Git failure means
-    *we could not tell*, and this used to catch the base ``GitError`` and treat all of them
-    as a pass -- so a repository carrying a repository-local command-bearing key, which is
-    exactly what ``git lfs install --local`` writes, turned the guard off for itself. So did
-    a Git older than 2.26, for every repository. That is the same fail-open shape the config
-    audit had one layer down: a check that did not run is not a pass.
+    The question is answered from the filesystem, by walking up looking for a ``.git``
+    entry, rather than by asking ``inspect_repository``. That is a correction, not a
+    simplification. ``inspect_repository`` was rewritten to require a repository *root* and
+    to raise ``NotAGitRepositoryError`` for anything else -- including a path deep inside a
+    repository -- and this guard read that as "not a repository, pass". One ``mkdir`` was
+    enough: with ``<repo>/.claude-away/`` already present, ``awayctl init`` created the
+    ledger inside the repository and exited 0. The guard only still fired when the whole
+    parent chain was missing, which is the only shape its tests covered.
+
+    A walk-up is also the right primitive independently. It consults no configuration, so
+    nothing a repository can write changes the answer, and it needs no Git process -- so
+    unlike the previous version it cannot be turned off by a repository whose configuration
+    makes Git fail. It deliberately does not care *which* repository, only that there is
+    one.
     """
     resolved = path.expanduser().resolve()
     # Nearest existing DIRECTORY, not nearest existing path. Stopping at the first thing
@@ -146,21 +152,13 @@ def _assert_db_outside_a_repository(path: Path) -> None:
     while not probe.is_dir() and probe.parent != probe:
         probe = probe.parent
 
-    try:
-        root: Path | None = inspect_repository(probe).root
-    except NotAGitRepositoryError:
-        return  # genuinely not a repository, which is what we want
-    except GitError as exc:
-        raise UnsafeStateLocationError(
-            f"cannot determine whether {probe} is inside a Git repository, so refusing to "
-            f"create the state database there. The ledger that decides whether work is DONE "
-            f"must live outside the repositories it judges, and a check that could not run "
-            f"is not a check that passed",
-            path=str(path),
-            probe=str(probe),
-            reason=exc.code,
-            detail=exc.message,
-        ) from exc
+    root: Path | None = None
+    for candidate in (probe, *probe.parents):
+        if (candidate / ".git").exists():
+            root = candidate
+            break
+    if root is None:
+        return  # genuinely not inside a repository, which is what we want
 
     raise UnsafeStateLocationError(
         f"refusing to create the state database inside the Git repository at "
@@ -476,6 +474,18 @@ def cmd_repos(args: argparse.Namespace) -> int:
         if "error" in entry:
             print(f" ERROR   {entry['project_id']}  {entry['root']}")
             print(f"      {entry['error']['code']}: {entry['error']['message']}")
+            # The details, not just the code and message. A default-deny configuration
+            # refusal that does not name the offending keys or the file they are in leaves
+            # the operator with a failure they cannot act on -- and `--json` carrying them
+            # while the human output did not is the wrong way round, because the human is
+            # the one who has to go and edit the file.
+            for name, value in sorted(entry["error"].get("details", {}).items()):
+                if value is None or name == "path":
+                    continue
+                rendered = (
+                    ", ".join(str(item) for item in value) if isinstance(value, list) else value
+                )
+                print(f"      {name}: {rendered}")
             continue
         base = entry["base"]
         mark = "ok " if base["resolved"] else "BLOCKED"
@@ -549,7 +559,21 @@ def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[lis
         if not repository.default_branch:
             unknown.append(repository.project_id)
 
-    return sorted(branches), sorted(unknown)
+    # A project that failed to enrol is in neither list otherwise: it contributes no
+    # protected branch AND no "we could not tell", so the matrix reads as though every
+    # project were accounted for. That is the exact collapse this function documents itself
+    # as preventing -- it just only fired when `enrol_projects` *raised*, and the common
+    # case records a failure instead. A failed project without a declared branch is the
+    # clearest possible case of "we could not tell".
+    for failure in enrolment.failures:
+        declared_for_failure = any(
+            str(project.get("id", "")) == failure.project_id and project.get("defaultBranch")
+            for project in document.get("projects", [])
+        )
+        if not declared_for_failure:
+            unknown.append(failure.project_id)
+
+    return sorted(branches), sorted(set(unknown))
 
 
 def cmd_policy(args: argparse.Namespace) -> int:

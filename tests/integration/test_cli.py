@@ -454,6 +454,38 @@ class TestPolicyAccountsForDiscoveredBranches:
 
 
 class TestInitRefusesToLiveInsideARepository:
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            ".claude-away/state.db",  # the directory the quickstart creates
+            "src/state.db",
+            "deep/nested/state.db",
+        ],
+    )
+    def test_an_existing_parent_directory_does_not_disarm_the_guard(
+        self, tmp_path: Path, relative: str
+    ) -> None:
+        """Every earlier case here used a path whose parents did NOT exist.
+
+        That gap hid a real bypass for one commit: the guard asked `inspect_repository`,
+        which had been rewritten to require a repository *root* and to raise
+        `NotAGitRepositoryError` for anything else -- including a path deep inside a
+        repository -- and the guard read that as "not a repository, pass". A single `mkdir`
+        was enough to put the ledger that decides whether work is DONE inside the repository
+        it judges. The parametrisation exists so the shape cannot go untested again.
+        """
+        from claude_away.cli.main import _assert_db_outside_a_repository
+        from claude_away.errors import UnsafeStateLocationError
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        target = repo.path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        with pytest.raises(UnsafeStateLocationError):
+            _assert_db_outside_a_repository(target)
+        assert not target.exists()
+
     def test_the_default_does_not_follow_the_working_directory(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:

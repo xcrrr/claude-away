@@ -63,8 +63,9 @@ So the deny-list is no longer the trust model. Three controls are, and all three
 3. **Every invocation is bound.** ``--git-dir`` and ``--work-tree`` are passed explicitly
    from the validated layout, so no configuration value, working directory or enclosing
    repository can change which tree is inspected. Submodules are then walked explicitly by
-   :func:`_inspect_subtree` with ``--ignore-submodules=all``, so Git never chooses to
-   descend into a repository that has not been through controls 1-3.
+   :func:`_inspect_subtree`, and each repository's own status runs with
+   ``--ignore-submodules=dirty`` so Git never scans the worktree of a repository that has
+   not been through controls 1-3 first.
 
 The ``-c`` pins in :data:`_PINNED_CONFIG` and the command-key audit in
 :func:`_repository_defined_command_config` both remain, now as defence in depth rather than
@@ -84,6 +85,7 @@ from claude_away.adapters.gitlayout import (
     RepositoryLayout,
     audit_local_config,
     discover_layout,
+    redact_config_key,
 )
 from claude_away.errors import (
     GitCommandError,
@@ -121,6 +123,10 @@ GIT_TIMEOUT_SECONDS = 60
 """Every Git call is bounded. An unattended run must not hang forever on a stuck lock."""
 
 _MAX_STDERR_CHARS = 2_000
+
+#: The sequencer's `opts` file is read only to tell a cherry-pick from a revert, so a few
+#: kilobytes is generous. It lives inside the repository, which is why it needs a bound.
+_MAX_SEQUENCER_BYTES = 64_000
 
 # Deny-by-default over the whole GIT_* namespace. An enumerated list of dangerous variables
 # was the previous design and it leaked: GIT_CONFIG_PARAMETERS was missing, and it alone is
@@ -667,6 +673,12 @@ def _gitlink_entries(runner: GitRunner) -> tuple[tuple[str, str], ...]:
         fields = metadata.split(b" ")
         if len(fields) < 3:
             raise GitOutputError("unparseable ls-files entry", record=_decode(record[:200]))
+        # Stage 0 only. A conflicted gitlink occupies stages 1, 2 and 3, and taking all of
+        # them recursed into the same submodule three times, emitted three disagreeing
+        # `SubmoduleState` rows for one path, and spent three times the walk budget. The
+        # conflict itself is not lost: `git status` reports it as unmerged.
+        if fields[2] != b"0":
+            continue
         entries.append((_decode(raw_path), fields[1].decode("ascii", "replace")))
     return tuple(entries)
 
@@ -784,7 +796,9 @@ def _inspect_subtree(
             "during inspection; Claude Away will not run them. Move the setting to your "
             "global configuration if you trust it, or remove it",
             path=str(layout.worktree),
-            keys=offenders,
+            # Redacted like every other key we name: `credential.<url>.helper` takes a URL
+            # subsection, and a URL subsection is where a token most often lives.
+            keys=[redact_config_key(key) for key in offenders],
         )
 
     # Then default-deny over everything else, parsed inertly from the files themselves.
@@ -814,9 +828,18 @@ def _inspect_subtree(
         try:
             child_layout = discover_layout(child_path)
         except NotAGitRepositoryError:
-            # Gitlinked but not initialised: no working tree, no configuration, nothing to
-            # carry into a branch. `--ignore-submodules=all` means Git does not descend into
-            # it either, so there is genuinely nothing here.
+            # No repository at the gitlink path. "Not initialised" was assumed here and the
+            # assumption was wrong: a gitlink path can also be a directory full of content
+            # whose `.git` was removed, and Git's own porcelain says *nothing* about it at
+            # any `--ignore-submodules` setting. Deleting `sub/.git` after replacing
+            # `sub/f` therefore reported the whole tree clean while the swapped content
+            # survived `git checkout -b`. Demonstrated before this branch existed.
+            #
+            # Empty means genuinely uninitialised, which is the case the old comment
+            # described. Anything else is content nobody can verify, which is not the same
+            # answer as "nothing to find".
+            if child_path.is_dir() and any(child_path.iterdir()):
+                nested_unverifiable.append(f"{relative}/")
             continue
         except UnsupportedRepositoryError as exc:
             raise UnsafeRepositoryConfigError(
@@ -891,18 +914,29 @@ def _inspect_subtree(
         nested_unverifiable.extend(f"{relative}/{entry}" for entry in child.status.unverifiable)
         nested_unverifiable.extend(f"{relative}/{entry}" for entry in child.nested_unverifiable)
 
-    # Last, once every child below has been cleared. `--ignore-submodules=all` stops Git
-    # spawning a status inside a submodule, but it does not stop Git *reading* the
-    # submodule's configuration file -- an unparseable one aborts the parent's status with
-    # exit 128. So the parent's own status is the final step rather than the first: by the
-    # time it runs, every configuration file it will touch has been through the allow-list.
+    # Last, once every child below has been cleared, and with `dirty` rather than `all`.
+    #
+    # `all` was the first attempt and it was a false-clean regression: it suppresses not
+    # only the submodule's worktree state -- which the walk above reconstructs, and better --
+    # but every *gitlink record* change too. A staged submodule bump (`M  sub`), a staged
+    # gitlink add or delete, a deleted submodule directory (`.D`) and a submodule replaced
+    # by a file or symlink (`.T`) all vanished, and six ordinary dirty states reported
+    # clean while `git status` itself printed them. `dirty` suppresses exactly the worktree
+    # half and keeps all five records; verified against real repositories for each case.
+    #
+    # `dirty` does let Git read a submodule's HEAD, and therefore its configuration. That is
+    # why this is the final step of the walk rather than the first: every child below has
+    # already been through layout discovery and the allow-list, so no unvalidated
+    # configuration file is reachable from here. `all` did not avoid this anyway -- Git
+    # reads a submodule's config either way, and an unparseable one aborts the parent's
+    # status with exit 128 under both settings.
     status = _parse_porcelain_v2(
         runner.run(
             "status",
             "--porcelain=v2",
             "-z",
             "--untracked-files=all",
-            "--ignore-submodules=all",
+            "--ignore-submodules=dirty",
         ).stdout,
         unverifiable=_unverifiable_paths(runner),
     )
@@ -925,7 +959,14 @@ def _unverifiable_paths(runner: GitRunner) -> tuple[str, ...]:
     """
     completed = runner.run("ls-files", "-v", "-z", check=False)
     if completed.returncode != 0:
-        return ()
+        # Not `return ()`. This function exists to report the paths `git status` is silent
+        # about, so answering "there are none" when the check did not run is the same
+        # fail-open the configuration audit was rewritten twice to remove.
+        raise GitCommandError(
+            list(completed.args),
+            completed.returncode,
+            completed.stderr.decode("utf-8", "replace")[:_MAX_STDERR_CHARS],
+        )
 
     flagged: list[str] = []
     for record in completed.stdout.split(b"\x00"):
@@ -965,7 +1006,11 @@ def _operations_in_progress(git_dir: Path) -> tuple[RepositoryOperation, ...]:
     if (git_dir / "sequencer" / "todo").exists():
         queued = RepositoryOperation.CHERRY_PICK
         try:
-            options = (git_dir / "sequencer" / "opts").read_text(encoding="utf-8", errors="replace")
+            # Bounded, and bounded *before* the read. This file is inside the repository, so
+            # its size is the repository's choice; a 2 GiB sparse one costs the writer
+            # nothing and cost this function 4 GiB of resident memory and 45 seconds.
+            with (git_dir / "sequencer" / "opts").open("rb") as handle:
+                options = handle.read(_MAX_SEQUENCER_BYTES).decode("utf-8", "replace")
         except OSError:
             options = ""
         if "revert" in options:
@@ -1113,6 +1158,11 @@ def resolve_local_ref(path: Path, ref: str, *, timeout: int = GIT_TIMEOUT_SECOND
 
     No fetch, ever. If the ref is not present locally, that is a fact the caller must act
     on, not something to repair behind their back.
+
+    ``path`` must be a repository root, like :func:`inspect_repository`'s -- a path that is
+    merely *inside* a repository raises rather than resolving, because the layout is
+    established from the filesystem instead of from ``git rev-parse``. In-tree callers pass
+    ``inspection.root``, which is already one.
     """
     if not is_safe_ref(ref):
         raise GitOutputError("refusing to resolve an unsafe ref name", ref=ref)

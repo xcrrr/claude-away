@@ -332,7 +332,11 @@ def _enrol_one(
         # the root through Git would let the repository's own `core.worktree` choose it. That
         # refusal is correct but says only "not a repository", so the far more likely cause
         # is diagnosed here -- from the filesystem, never from Git -- and named.
-        enclosing = _enclosing_repository_root(resolved)
+        # Only when the enrolled path has no `.git` entry of its own. A path that *does*
+        # have one and still failed is a repository with something wrong inside it -- a
+        # dangling gitdir pointer, an unreadable `.git` -- and calling that "a subdirectory
+        # of <parent>" sends the operator to enrol the wrong root.
+        enclosing = None if (resolved / ".git").exists() else _enclosing_repository_root(resolved)
         if enclosing is None:
             raise
         raise EnrolmentError(

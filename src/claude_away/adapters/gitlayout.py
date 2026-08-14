@@ -33,6 +33,7 @@ than as the trust model.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,7 @@ __all__ = [
     "RepositoryLayout",
     "audit_local_config",
     "discover_layout",
+    "redact_config_key",
 ]
 
 #: Bump when the allow-list changes, so a refusal can be traced to a policy version.
@@ -80,21 +82,97 @@ class RepositoryLayout:
         }
 
 
+#: URL userinfo inside a configuration key. Git subsection names are arbitrary strings and
+#: routinely *are* URLs -- ``url.https://x-access-token:<token>@github.com/.insteadOf`` is
+#: what ``actions/checkout`` writes, and ``http.https://user:pass@host/.extraHeader`` and
+#: ``lfs.https://user:pass@host/info/lfs.access`` are the same shape. None of those keys is
+#: on the allow-list, so a default-deny audit is *guaranteed* to name them in its refusal.
+_USERINFO = re.compile(r"(?<=//)[^/@]*@")
+
+
+def redact_config_key(key: str) -> str:
+    """Remove credentials from a configuration key before it reaches a diagnostic.
+
+    Refusing to print configuration *values* was the obvious half and it was done first. It
+    is not sufficient: a Git key's middle component is an arbitrary subsection name, and the
+    single most common way a credential ends up in a repository's local configuration puts
+    it there rather than in a value. Redacting values only would have applied the guarantee
+    to exactly the half that did not need it.
+    """
+    return _USERINFO.sub("<redacted>@", key)
+
+
+_GITDIR_PREFIX = b"gitdir: "
+
+
+def _read_bounded(path: Path) -> bytes:
+    """Read at most :data:`_MAX_POINTER_BYTES`, without reading the rest first.
+
+    ``read_bytes()[:_MAX_POINTER_BYTES]` was a cap in appearance only: the whole file
+    reached memory before the slice, so a 2 GiB sparse ``.git`` -- free to create -- cost
+    2 GiB of resident memory and half a minute, once per repository in the walk. The size
+    is chosen by the repository, so the memory was too.
+    """
+    with path.open("rb") as handle:
+        return handle.read(_MAX_POINTER_BYTES)
+
+
+def _reject_nul(raw: bytes, *, path: Path, what: str) -> None:
+    """A NUL byte cannot appear in a path, and ``Path.resolve`` raises ``ValueError``.
+
+    Not a ``ClaudeAwayError``, so it escaped every handler: ``enrol_projects`` catches
+    ``GitError`` and the CLI catches ``ClaudeAwayError``, so one repository with a NUL in
+    its ``.git`` pointer replaced the whole ``awayctl repos`` report with a traceback and
+    took every other repository's verdict with it.
+    """
+    if b"\x00" in raw:
+        raise UnsupportedRepositoryError(
+            f"the {what} contains a NUL byte, which cannot be part of a path", path=str(path)
+        )
+
+
+def _trim_eol(raw: bytes) -> bytes:
+    """Remove trailing ``\\n`` and ``\\r``, and nothing else.
+
+    Git's ``read_gitfile_gently`` and its ``commondir`` reader both trim exactly these two
+    characters. ``.strip()`` was used here first and it was a real defect, not a nicety: a
+    git directory legitimately named ``store `` -- which ``git init --separate-git-dir`` and
+    ``git submodule add`` both produce for a path ending in a space -- came back as
+    ``store``, so this module named a git directory Git would never use. With a decoy
+    directory at the trimmed name, every bound invocation was then pointed at a *different
+    repository*, and the whole inspection agreed with itself while disagreeing with Git.
+    Demonstrated before this was written: HEAD and branch reported from the decoy.
+
+    The same mistake had already been made and fixed once in ``GitRunner.path``. Reading
+    bytes and trimming exactly what Git trims is the only version of this that is right.
+    """
+    while raw.endswith((b"\n", b"\r")):
+        raw = raw[:-1]
+    return raw
+
+
 def _read_pointer(dot_git: Path) -> Path:
-    """Resolve a ``gitdir:`` pointer file -- what submodules and linked worktrees use."""
+    """Resolve a ``gitdir:`` pointer file -- what submodules and linked worktrees use.
+
+    Deliberately as strict as Git: the file must begin with exactly ``gitdir: ``, one space,
+    no leading whitespace. Git rejects anything else with ``invalid gitfile format``, and a
+    parser more permissive than Git's would inspect trees Git does not consider repositories
+    at all -- and, in the padded-whitespace case, would pick a different path than Git.
+    """
     try:
-        raw = dot_git.read_bytes()[:_MAX_POINTER_BYTES]
+        raw = _read_bounded(dot_git)
     except OSError as exc:
         raise NotAGitRepositoryError(
             "the .git entry could not be read", path=str(dot_git), detail=str(exc)
         ) from exc
 
-    text = os.fsdecode(raw).strip()
-    if not text.startswith("gitdir:"):
+    raw = _trim_eol(raw)
+    if not raw.startswith(_GITDIR_PREFIX):
         raise UnsupportedRepositoryError(
             "the .git entry is a file but is not a gitdir pointer", path=str(dot_git)
         )
-    target = text[len("gitdir:") :].strip()
+    _reject_nul(raw, path=dot_git, what="gitdir pointer")
+    target = os.fsdecode(raw[len(_GITDIR_PREFIX) :])
     if not target:
         raise UnsupportedRepositoryError("the gitdir pointer is empty", path=str(dot_git))
 
@@ -152,12 +230,16 @@ def discover_layout(path: Path) -> RepositoryLayout:
     commondir_file = git_dir / "commondir"
     if commondir_file.is_file():
         try:
-            raw = commondir_file.read_bytes()[:_MAX_POINTER_BYTES]
+            raw = _read_bounded(commondir_file)
         except OSError as exc:
             raise UnsupportedRepositoryError(
                 "commondir could not be read", path=str(worktree), detail=str(exc)
             ) from exc
-        target = Path(os.fsdecode(raw).strip())
+        # Same rule as the gitdir pointer, for the same reason: Git preserves a trailing
+        # space in `commondir`, and `common_dir` is what `local_config` is derived from --
+        # so trimming it would move the file the default-deny audit reads.
+        _reject_nul(raw, path=commondir_file, what="commondir file")
+        target = Path(os.fsdecode(_trim_eol(raw)))
         common_dir = (target if target.is_absolute() else git_dir / target).resolve()
         if not common_dir.is_dir():
             raise UnsupportedRepositoryError(
@@ -193,8 +275,20 @@ def discover_layout(path: Path) -> RepositoryLayout:
 # Default-deny configuration allow-list
 # ======================================================================================
 
-#: Exact keys (lower-cased) a normal repository needs. Deliberately small: everything not
-#: here is refused, which is what makes the next key Git invents safe by default.
+#: Exact keys (lower-cased) a normal repository needs. Everything not here is refused, which
+#: is what makes the next key Git invents safe by default.
+#:
+#: The admission rule, applied to every entry below: the key must be unable to change (a)
+#: what any command this adapter runs *executes*, or (b) what ``git status`` and
+#: ``git ls-files`` *report*. That second clause is why a few plausible-looking keys are
+#: absent on purpose. ``core.excludesFile`` and ``core.attributesFile`` name files that
+#: decide which untracked paths are hidden and which filter applies, ``status.showUntracked-
+#: Files`` decides what status mentions, and ``core.fsmonitor`` decides what Git thinks
+#: changed -- all four are masking vectors, so all four stay refused.
+#:
+#: The list is not minimal, and that is deliberate: an allow-list that refuses a large share
+#: of real projects is not a safeguard anybody can use. The first version refused this
+#: project's own repository, over ``gc.auto``.
 _ALLOWED_EXACT = frozenset(
     {
         "core.repositoryformatversion",
@@ -209,6 +303,7 @@ _ALLOWED_EXACT = frozenset(
         "core.worktree",
         "core.sparsecheckout",
         "core.sparsecheckoutcone",
+        "index.sparse",
         "core.untrackedcache",
         "core.longpaths",
         "core.fscache",
@@ -218,11 +313,92 @@ _ALLOWED_EXACT = frozenset(
         "extensions.partialclone",
         "user.name",
         "user.email",
+        "user.signingkey",
         "commit.gpgsign",
+        "tag.gpgsign",
+        "gpg.format",
         "push.default",
         "pull.rebase",
         "submodule.active",
         "lfs.repositoryformatversion",
+        "lfs.url",
+        # Housekeeping. `gc.auto = 0` alone made the first version of this list refuse the
+        # Claude Away repository itself, which is how a safeguard becomes something people
+        # switch off.
+        "gc.auto",
+        "gc.autodetach",
+        "gc.pruneexpire",
+        "gc.reflogexpire",
+        "gc.reflogexpireunreachable",
+        "gc.writecommitgraph",
+        "maintenance.auto",
+        "maintenance.strategy",
+        # Per-repository preferences. Inert for a read-only inspection: none of them changes
+        # what status reports or what any command executes.
+        "pull.ff",
+        "pull.twohead",
+        "push.autosetupremote",
+        "push.followtags",
+        "push.gpgsign",
+        "fetch.prune",
+        "fetch.prunetags",
+        "fetch.parallel",
+        "fetch.writecommitgraph",
+        "rebase.autostash",
+        "rebase.autosquash",
+        "rebase.updaterefs",
+        "rerere.enabled",
+        "rerere.autoupdate",
+        "diff.algorithm",
+        "diff.renames",
+        "diff.renamelimit",
+        "diff.colormoved",
+        "merge.ff",
+        "merge.conflictstyle",
+        "merge.renamelimit",
+        "branch.autosetupmerge",
+        "branch.autosetuprebase",
+        "branch.sort",
+        "tag.sort",
+        "log.date",
+        "log.follow",
+        "color.ui",
+        "commit.verbose",
+        "help.autocorrect",
+        "remote.pushdefault",
+        # `init.defaultBranch` is deliberately NOT here. It says what `git init` should name
+        # a *new* repository's first branch -- a global preference with no bearing on a
+        # repository that already exists -- and setting it locally is how a repository once
+        # moved protection off `main`. `_resolve_default_branch` no longer reads it, so the
+        # refusal is belt and braces, but a key whose only local use was an attack does not
+        # get waved through for tidiness.
+        # Monorepo and large-checkout tuning, all of it about how Git stores and reads its
+        # own data rather than about what it finds.
+        "feature.manyfiles",
+        "feature.experimental",
+        "index.version",
+        "index.threads",
+        "core.commitgraph",
+        "core.multipackindex",
+        "core.splitindex",
+        "core.preloadindex",
+        "core.bigfilethreshold",
+        "core.deltabasecachelimit",
+        "checkout.workers",
+        "submodule.fetchjobs",
+        "pack.threads",
+        "http.postbuffer",
+        "transfer.fsckobjects",
+        # git-flow writes exactly these and nothing else; `gitflow` is not a Git namespace,
+        # so listing the keys costs nothing and avoids a prefix allowance.
+        "gitflow.branch.master",
+        "gitflow.branch.develop",
+        "gitflow.prefix.feature",
+        "gitflow.prefix.bugfix",
+        "gitflow.prefix.release",
+        "gitflow.prefix.hotfix",
+        "gitflow.prefix.support",
+        "gitflow.prefix.versiontag",
         # The one entry here that is not inert on its own: it names a directory of
         # executables. It is allowed because `core.hooksPath` is pinned to /dev/null on
         # every invocation (see `_PINNED_CONFIG`), so a repository's value cannot apply --
@@ -246,11 +422,18 @@ _ALLOWED_PATTERNS: tuple[tuple[str, str], ...] = (
     # increasingly the default in CI -- would be refused.
     ("remote.", ".promisor"),
     ("remote.", ".partialclonefilter"),
+    ("remote.", ".mirror"),
+    ("remote.", ".skipfetchall"),
+    ("remote.", ".skipdefaultupdate"),
+    # Written by `gh repo fork` / `gh pr`; inert metadata naming the upstream.
+    ("remote.", ".gh-resolved"),
     ("branch.", ".remote"),
     ("branch.", ".pushremote"),
     ("branch.", ".merge"),
     ("branch.", ".rebase"),
     ("branch.", ".description"),
+    # Written by VS Code, one per branch it has looked at.
+    ("branch.", ".vscode-merge-base"),
     ("submodule.", ".url"),
     ("submodule.", ".active"),
     # Honoured by nobody here: submodules are walked manually rather than through Git's
@@ -374,7 +557,16 @@ def audit_local_config(layout: RepositoryLayout, *, timeout: int = 60) -> None:
             continue
 
         # Values that decide identity or supported operation are validated, not just allowed.
-        if key == "core.bare" and value.strip().lower() in _BOOL_TRUE:
+        if (
+            key == "core.bare"
+            and value.strip().lower() in _BOOL_TRUE
+            # `git clone --bare` + `git worktree add` is an ordinary workflow, and the bare
+            # repository's `core.bare = true` is also the *common* config of every linked
+            # worktree it hosts. Refusing on the value alone rejected a tree with a working
+            # `git status`, and the operator could not fix it without breaking Git. A linked
+            # worktree is exactly `git_dir != common_dir`, and by construction is not bare.
+            and layout.git_dir == layout.common_dir
+        ):
             raise UnsupportedRepositoryError(
                 "bare repositories are not supported: Claude Away needs a working tree",
                 path=str(layout.worktree),
@@ -385,7 +577,14 @@ def audit_local_config(layout: RepositoryLayout, *, timeout: int = 60) -> None:
                 path=str(layout.worktree),
                 version=value.strip(),
             )
-        if key == "core.worktree":
+        if key == "core.worktree" and layout.git_dir == layout.common_dir:
+            # Only for the repository that owns the config. For a linked worktree the
+            # *common* config is the primary checkout's, and a submodule's common config
+            # legitimately carries `core.worktree` pointing at the submodule's own primary
+            # checkout -- so comparing it against the linked worktree refused every
+            # `git worktree add` made inside a submodule, with no remedy the operator could
+            # apply. `git_dir != common_dir` is exactly "this is a linked worktree", and the
+            # binding means the value cannot take effect there either way.
             declared = Path(value)
             if not declared.is_absolute():
                 declared = layout.git_dir / declared
@@ -406,22 +605,35 @@ def audit_local_config(layout: RepositoryLayout, *, timeout: int = 60) -> None:
                     policy_version=ALLOWED_LOCAL_CONFIG_VERSION,
                 )
 
-    if includes:
-        raise UnsafeRepositoryConfigError(
-            "repository-local configuration uses an include directive; includes are not "
-            "followed, because they add configuration this audit would never see",
-            path=str(layout.worktree),
-            keys=sorted(includes),
-            policy_version=ALLOWED_LOCAL_CONFIG_VERSION,
-        )
+    if not (includes or offenders):
+        return
 
-    if offenders:
-        raise UnsafeRepositoryConfigError(
-            "repository-local Git configuration contains keys Claude Away does not support. "
-            "Local configuration is default-deny: only a small allow-list of keys a normal "
-            "repository needs is accepted. Move the setting to your global configuration if "
-            "you trust it, or remove it",
-            path=str(layout.worktree),
-            keys=sorted(set(offenders)),
-            policy_version=ALLOWED_LOCAL_CONFIG_VERSION,
+    # Both are reported in one pass. Raising on includes first meant an operator with an
+    # include *and* an unrecognised key fixed one, re-ran, and only then learned about the
+    # other -- an avoidable second round trip through a failing unattended run.
+    reasons: list[str] = []
+    if includes:
+        reasons.append(
+            "include directives are not followed, because they add configuration this audit "
+            "would never see"
         )
+    if offenders:
+        reasons.append(
+            "local configuration is default-deny, so only a small allow-list of keys a "
+            "normal repository needs is accepted"
+        )
+    raise UnsafeRepositoryConfigError(
+        "repository-local Git configuration contains keys Claude Away does not support ("
+        + "; ".join(reasons)
+        + "). Remove them from the file named below, or move the setting to your global "
+        "configuration if you trust it",
+        path=str(layout.worktree),
+        keys=sorted({redact_config_key(key) for key in includes + offenders}),
+        config=str(layout.local_config),
+        worktree_config=(
+            str(layout.worktree_config)
+            if extensions_worktree_config and layout.worktree_config is not None
+            else None
+        ),
+        policy_version=ALLOWED_LOCAL_CONFIG_VERSION,
+    )
