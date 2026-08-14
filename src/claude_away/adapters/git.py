@@ -751,16 +751,22 @@ def _inspect_subtree(
     submodule could be cleared by one and never looked at by the other -- and then round
     four's, where the two disagreed about *which directory* a repository even was.
 
-    Each level does the same five things, in order:
+    Each level does the same things, in this order:
 
-    1. establish the layout from the filesystem (the caller has already done this for the
-       top level; children are discovered here);
-    2. refuse the repository if its own configuration is not on the allow-list;
-    3. build a runner bound to that validated layout with explicit ``--git-dir`` and
-       ``--work-tree``;
-    4. run *that repository's* status with submodules ignored for that individual command,
-       so Git never spawns a child process inside a repository we have not cleared yet;
-    5. enumerate gitlinks from its index and recurse into each initialised child.
+    1. refuse a cycle -- a git directory already being walked -- and spend one unit of the
+       shared walk budget;
+    2. build a runner bound to the layout with explicit ``--git-dir`` and ``--work-tree``.
+       This comes before the audits rather than after, because one of the audits is executed
+       *through* it;
+    3. audit configuration: the command-bearing-key check over effective configuration
+       first, because it is the one that fails closed on a Git too old to report scopes, then
+       the default-deny allow-list over the files themselves;
+    4. read HEAD and enumerate gitlinks from the index;
+    5. recurse into every initialised child, which repeats 1-6 for each;
+    6. run *this* repository's status, last, once everything below it has been cleared.
+
+    The layout itself is established by :func:`~claude_away.adapters.gitlayout.discover_layout`
+    -- by the caller for the top level, and here for each child.
 
     ``--ignore-submodules=all`` is deliberate and is the opposite of the previous design's
     ``=none``. ``=none`` asked Git to descend, which meant Git chose what to run and where,

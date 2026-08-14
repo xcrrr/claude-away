@@ -323,7 +323,12 @@ covers redirection at the top level and inside a submodule, two-level nesting th
 different hiding routes, default-deny polarity, include refusal, secret-free diagnostics, and
 — just as important — that plain `git init`, a clone, `--separate-git-dir`, a linked
 worktree, `extensions.worktreeConfig`, an ordinary submodule, and ordinary local settings all
-still work. Nine mutations of the guards were applied and each was observed to fail the suite.
+still work. Nine mutations of the guards were applied; eight failed the suite and the ninth -- removing
+`--no-includes` -- is an equivalent mutant, because `git config --file` does not expand
+includes at all. A later round found five further guards that no test pinned (the
+containment check on a child worktree, the cycle check, the gitlink-OID comparison, the
+nested `unverifiable` paths, and the `core.bare`/format-version value validation); each now
+has a test written from the proof-of-concept that survived.
 
 *The default branch is never guessed, and it says where it came from.* Configuration, then
 `refs/remotes/origin/HEAD`, then `None`. There is no fallback to "main" because guessing the

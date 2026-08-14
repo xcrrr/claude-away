@@ -75,11 +75,14 @@ class TestWorktreeRedirection:
         repo.git("config", "core.worktree", str(decoy))
         (repo.path / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
 
-        try:
-            status = inspect_repository(repo.path).status
-        except (UnsafeRepositoryConfigError, UnsupportedRepositoryError):
-            return  # refusing before status is an equally correct answer
-        assert not status.is_clean, "the decoy tree was inspected instead of the enrolled one"
+        # Asserted as a refusal, not as "refusal OR dirty". Instrumentation showed the
+        # `except: return` version never reached its assertion, so the test named a property
+        # it did not check and duplicated a cheaper one. The bound runner's independent
+        # behaviour -- that it inspects the enrolled tree even when the audit is bypassed --
+        # is pinned by `test_a_bound_runner_ignores_core_worktree`.
+        with pytest.raises(UnsafeRepositoryConfigError, match=r"core\.worktree"):
+            inspect_repository(repo.path)
+        assert (repo.path / "a.txt").read_text(encoding="utf-8").startswith("SOMEONE")
 
     def test_submodule_redirection_cannot_hide_uncommitted_work(self, tmp_path: Path) -> None:
         source = make_repo(tmp_path / "src")
@@ -108,12 +111,8 @@ class TestWorktreeRedirection:
         )
         (child / "a.txt").write_text("SOMEONE ELSE'S WORK\n", encoding="utf-8")
 
-        try:
-            status = inspect_repository(super_repo.path).status
-        except (UnsafeRepositoryConfigError, UnsupportedRepositoryError):
-            return
-        assert not status.is_clean, "the submodule's decoy was inspected"
-        assert "mod" in [module.path for module in status.dirty_submodules]
+        with pytest.raises(UnsafeRepositoryConfigError, match=r"core\.worktree"):
+            inspect_repository(super_repo.path)
 
 
 class TestNestedSubmodules:
@@ -210,13 +209,17 @@ class TestDefaultDenyLocalConfig:
     @pytest.mark.parametrize("directive", ["include.path", "includeIf.gitdir:/.path"])
     def test_local_includes_are_refused(self, tmp_path: Path, directive: str) -> None:
         """An include is a way to add config the audit never sees."""
+        # An INERT included key. With a command-bearing one the effective-configuration
+        # audit fired first and this test passed without the include branch ever running --
+        # it could not tell the two refusals apart, because it asserted only the type.
         extra = tmp_path / "extra.cfg"
-        extra.write_text('[filter "pwn"]\n\tclean = /bin/true\n', encoding="utf-8")
+        extra.write_text("[futureclaudeawaytest]\n\tincluded = 1\n", encoding="utf-8")
 
         repo = make_repo(tmp_path / "repo")
         repo.git("config", directive, str(extra))
-        with pytest.raises(UnsafeRepositoryConfigError):
+        with pytest.raises(UnsafeRepositoryConfigError) as caught:
             inspect_repository(repo.path)
+        assert any(key.lower().startswith("include") for key in caught.value.details["keys"])
 
     def test_an_included_secret_never_reaches_diagnostics(self, tmp_path: Path) -> None:
         extra = tmp_path / "extra.cfg"
@@ -581,8 +584,16 @@ class TestRealWorldRepositoriesAreNotRefused:
         repo.git("config", key, value)
         assert inspect_repository(repo.path).status.is_clean
 
-    def test_a_hooks_path_cannot_actually_fire(self, tmp_path: Path) -> None:
-        """Why allowing `core.hooksPath` is safe: the pin outranks it on every invocation."""
+    def test_a_hooks_path_does_not_fire_during_inspection(self, tmp_path: Path) -> None:
+        """A repository-named hooks directory is never consulted during an inspection.
+
+        Honest scope: this does NOT pin the `-c core.hooksPath=/dev/null` override, and it
+        was originally written as though it did. It passes with that pin removed, because
+        read-only inspection under `GIT_OPTIONAL_LOCKS=0` never writes the index and so
+        never reaches a hook at all. The pin itself is pinned by
+        `test_repository_trust.py::test_every_pinned_key_is_actually_passed`, as an argv
+        contract. Both facts together are the reason `core.hooksPath` is allow-listed.
+        """
         repo = make_repo(tmp_path / "repo")
         marker = tmp_path / "EXECUTED"
         hooks = tmp_path / "hooks"
@@ -597,8 +608,13 @@ class TestRealWorldRepositoriesAreNotRefused:
 
         assert not marker.exists(), "a repository-named hooks directory was consulted"
 
-    def test_a_sha256_style_extension_is_accepted(self, tmp_path: Path) -> None:
+    def test_extensions_object_format_is_accepted_at_format_version_one(
+        self, tmp_path: Path
+    ) -> None:
         """`extensions.objectFormat` is v1-only, so the format version has to move with it.
+
+        The value is `sha1`, not `sha256`: a real sha256 repository cannot be faked with a
+        config line, and what needs pinning is that the key is accepted at all.
 
         Parametrising it alongside the v0 keys made Git itself refuse the fixture, which
         would have hidden whether the allow-list accepts the key at all.
@@ -986,3 +1002,109 @@ class TestGitlinkRecordChangesAreNotSuppressed:
         status = inspect_repository(root).status
         assert not status.is_clean
         assert [module.path for module in status.submodules].count("sub") <= 1
+
+
+class TestGuardsThatNoTestReached:
+    """Five guards a mutation run proved unpinned: each mutation survived the whole suite.
+
+    Every test here was written from the proof-of-concept that survived, not from the
+    guard's source, so it asserts the observable difference rather than the branch.
+    """
+
+    def test_a_gitlink_escaping_its_superproject_is_refused(self, tmp_path: Path) -> None:
+        """Deleting the containment check let the walk inspect and report on an outside tree."""
+        outside = make_repo(tmp_path / "outside")
+        outside.write("o.txt", "x")
+        outside.commit_all("outside")
+
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("init")
+        child = submodule(top.path, source.path, "mod")
+
+        import shutil
+
+        shutil.rmtree(child)
+        child.symlink_to(outside.path, target_is_directory=True)
+
+        with pytest.raises(UnsafeRepositoryConfigError, match="outside its superproject"):
+            inspect_repository(top.path)
+
+    def test_a_submodule_pointing_at_an_ancestors_git_dir_is_refused(self, tmp_path: Path) -> None:
+        """Deleting the cycle check replaced the refusal with a verdict computed while
+        re-walking the superproject as its own submodule."""
+        source = make_repo(tmp_path / "src")
+        source.write("a.txt", "x")
+        source.commit_all("inner")
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("init")
+        child = submodule(top.path, source.path, "mod")
+
+        (child / ".git").write_text(f"gitdir: {top.path / '.git'}\n", encoding="utf-8")
+
+        with pytest.raises(UnsafeRepositoryConfigError, match="cycle"):
+            inspect_repository(top.path)
+
+    def test_a_submodule_at_a_different_commit_than_recorded_is_dirty(self, tmp_path: Path) -> None:
+        """The signal the design gave up `--ignore-submodules=none` to reconstruct by hand.
+
+        With `commit_changed` forced to False the whole suite still passed, so nothing
+        exercised it end to end. Asserted here on an otherwise entirely clean tree, so the
+        gitlink comparison is the only thing that can produce the verdict.
+        """
+        source = make_repo(tmp_path / "src")
+        source.write("f.txt", "one\n")
+        source.commit_all("one")
+        top = make_repo(tmp_path / "top")
+        top.write("t.txt", "t")
+        top.commit_all("init")
+        child = submodule(top.path, source.path, "mod")
+
+        git("-C", str(child), "checkout", "-q", "-b", "ahead")
+        (child / "f.txt").write_text("two\n", encoding="utf-8")
+        git("-C", str(child), "add", "-A")
+        git("-C", str(child), "commit", "-q", "-m", "advance")
+
+        status = inspect_repository(top.path).status
+        assert not status.is_clean
+        assert [module.path for module in status.dirty_submodules] == ["mod"]
+        assert next(m for m in status.submodules if m.path == "mod").commit_changed
+
+    def test_a_nested_unverifiable_path_is_named_not_merely_counted(self, tmp_path: Path) -> None:
+        """Dropping `nested_unverifiable` left `is_clean` correct by a second route.
+
+        The path vanished from the report while the verdict stayed right, so every existing
+        assertion held. An operator reading `awayctl repos --json` to find out *what* is
+        unverifiable got an empty list.
+        """
+        top, deep = TestNestedSubmodules()._chain(tmp_path)
+        (deep / "d.txt").write_text("CHANGED\n", encoding="utf-8")
+        git("-C", str(deep), "update-index", "--assume-unchanged", "d.txt")
+
+        status = inspect_repository(top).status
+        assert "mid/deep/d.txt" in status.unverifiable, status.unverifiable
+
+    def test_core_bare_true_with_a_working_tree_is_refused(self, tmp_path: Path) -> None:
+        """Deleting the value validation turned a refusal into `is_clean = True`."""
+        repo = make_repo(tmp_path / "repo")
+        repo.git("config", "core.bare", "true")
+        with pytest.raises(UnsupportedRepositoryError, match="bare repositories"):
+            inspect_repository(repo.path)
+
+    def test_an_unsupported_format_version_is_a_typed_refusal(self, tmp_path: Path) -> None:
+        """Not an opaque `GitCommandError` from git's own exit 128.
+
+        The nearest existing test asserted only that the error was not
+        `NotAGitRepositoryError`, which a `GitCommandError` satisfies -- so the validation
+        could be deleted with the suite green.
+        """
+        repo = make_repo(tmp_path / "repo")
+        (repo.path / ".git" / "config").write_text(
+            "[core]\n\trepositoryformatversion = 99\n", encoding="utf-8"
+        )
+        with pytest.raises(UnsupportedRepositoryError, match="format version"):
+            inspect_repository(repo.path)

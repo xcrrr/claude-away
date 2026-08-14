@@ -572,10 +572,13 @@ def audit_local_config(layout: RepositoryLayout, *, timeout: int = 60) -> None:
                 path=str(layout.worktree),
             )
         if key == "core.repositoryformatversion" and value.strip() not in {"0", "1"}:
+            # The one place a configuration *value* is repeated back. It is a small integer
+            # naming a repository format, it is what the operator needs in order to act, and
+            # it cannot carry a credential. Nothing else here echoes a value.
             raise UnsupportedRepositoryError(
                 "unsupported repository format version",
                 path=str(layout.worktree),
-                version=value.strip(),
+                version=value.strip()[:32],
             )
         if key == "core.worktree" and layout.git_dir == layout.common_dir:
             # Only for the repository that owns the config. For a linked worktree the
