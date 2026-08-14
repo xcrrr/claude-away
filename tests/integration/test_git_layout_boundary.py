@@ -808,12 +808,31 @@ class TestDiagnosticsCarryNoCredentials:
 
 
 class TestTheAllowListCoversRealProjects:
+    #: Keys a CI runner injects into the checkout it just made. They are deliberately
+    #: refused -- `http.<url>.extraHeader` carries the credential Git sends -- so their
+    #: presence says nothing about whether *ordinary* repositories are accepted.
+    _HARNESS_INJECTED = ("http.", ".extraheader")
+
     def test_this_projects_own_repository_is_accepted(self) -> None:
         """The first version of the allow-list refused it, over `gc.auto`.
 
-        A safeguard that refuses the project it ships in is one nobody will leave switched on.
+        A safeguard that refuses the project it ships in is one nobody will leave switched
+        on. Run against the real repository rather than a fixture, because the point is that
+        the allow-list survives contact with a config nobody curated for it.
+
+        On a CI runner `actions/checkout` writes `http.https://github.com/.extraheader` into
+        that same config, and that key is correctly refused. Skipping on exactly that key
+        keeps the test meaningful where it can run and honest where it cannot -- failing
+        would report a working guard as broken.
         """
-        audit_local_config(discover_layout(Path(__file__).resolve().parents[2]))
+        try:
+            audit_local_config(discover_layout(Path(__file__).resolve().parents[2]))
+        except UnsafeRepositoryConfigError as refusal:
+            offenders = [key.lower() for key in refusal.details["keys"]]
+            prefix, suffix = self._HARNESS_INJECTED
+            if all(key.startswith(prefix) and key.endswith(suffix) for key in offenders):
+                pytest.skip(f"the checkout harness injected refused keys: {offenders}")
+            raise
 
     @pytest.mark.parametrize(
         "key,value",
@@ -1067,7 +1086,21 @@ class TestGuardsThatNoTestReached:
         git("-C", str(child), "checkout", "-q", "-b", "ahead")
         (child / "f.txt").write_text("two\n", encoding="utf-8")
         git("-C", str(child), "add", "-A")
-        git("-C", str(child), "commit", "-q", "-m", "advance")
+        # Identity passed explicitly. `git submodule add` clones, and the clone's config
+        # carries no `user.*` -- so this commit depends on an ambient global identity, which
+        # a CI runner does not have. It failed with exit 128 there while passing locally.
+        git(
+            "-C",
+            str(child),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "advance",
+        )
 
         status = inspect_repository(top.path).status
         assert not status.is_clean
