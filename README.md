@@ -105,22 +105,29 @@ without crash recovery is not a release.
 - task graph validation — dependencies, cycles, readiness;
 - leases, so two runners can never work the same task at once;
 - append-only evidence and audit history;
-- over 200 tests covering crash recovery, concurrency and replay.
+- the repository boundary: which repositories are enrolled, what state each one is in, and
+  which operations policy would permit there;
+- over 400 tests covering crash recovery, concurrency, replay and Git edge cases.
 
-**Not built yet** — everything that executes:
+**Not built yet** — everything that changes a repository or runs a model:
 
-- running Claude, running your test commands, Git branches and worktrees;
+- creating branches or worktrees, committing, pushing, opening pull requests;
+- running Claude, running your test commands;
 - the capacity-aware scheduler;
 - the planner and the `/claude-away:*` commands;
 - the long-running supervisor and the return briefing;
 - Graphify and Obsidian integration.
+
+Today `awayctl` can tell you that a repository is enrolled, clean, on its default branch and
+safe to branch from — and then deliberately stops, because the part that would do the
+branching is the next milestone.
 
 See the [roadmap](docs/ROADMAP.md) and the [v0.1 plan](docs/V0_1_IMPLEMENTATION_PLAN.md)
 for the order these arrive in.
 
 ## Try the core
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer and Git 2.26 or newer.
 
 ```bash
 git clone https://github.com/xcrrr/claude-away
@@ -131,6 +138,15 @@ awayctl init                 # create the state database
 awayctl status               # show the plan
 awayctl doctor               # check the state for problems
 awayctl gate AWAY-0001       # explain why a task can or cannot be completed
+
+# the allow/deny matrix for a configuration — reads no repositories
+awayctl policy examples/config.example.json
+
+# read-only inspection of the repositories you enrolled. Copy the example first and
+# point `projects[].path` at repositories that exist on your machine: the shipped
+# example names /home/you/code/api, so this refuses until you edit it.
+cp examples/config.example.json my-config.json
+awayctl repos my-config.json
 ```
 
 Every command also takes `--json`, because an unattended supervisor should never have to

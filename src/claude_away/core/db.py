@@ -689,48 +689,70 @@ class Database:
     def migrate(self) -> int:
         """Apply outstanding migrations and return the resulting schema version.
 
-        Idempotent: running it against an up-to-date database is a no-op. Each migration
-        commits together with its ledger row, so a crash leaves the database at a known
-        version rather than partially upgraded.
+        Idempotent: running it against an up-to-date database is a no-op, and two processes
+        opening the same fresh database converge cleanly rather than one of them seeing an
+        opaque "table already exists".
+
+        **The version check and the migrations it gates share one transaction.** Reading the
+        version under the write lock and then releasing it before applying is a
+        time-of-check/time-of-use gap: both openers read 0, both enter the loop, and the
+        loser dies on the first `CREATE TABLE`. Holding ``BEGIN IMMEDIATE`` across the whole
+        operation means the second opener cannot read the version until the first has
+        committed, at which point it sees the new version and skips.
+
+        Per-migration history is preserved -- each migration still writes its own
+        ``schema_migrations`` row, so the ledger records what was applied and when.
+
+        Atomicity is now *batch*-wide, which is stronger than what it replaced and worth
+        stating precisely rather than describing as "unchanged". Every pending migration
+        runs inside the one transaction, so a crash while applying migration 3 of a 1..3
+        batch rolls the database back to the version it started at -- not to 2. A partially
+        upgraded schema is still impossible, which is the property that matters; the
+        difference only becomes observable once a second migration exists, and the honest
+        description is the one that will still be true then.
         """
-        self._ensure_migration_ledger()
-        # Take the write lock before reading the version: two processes opening a fresh
-        # database at once would otherwise both read 0 and both try to apply migration 1.
-        # The ledger's primary key would catch it, but as an opaque constraint error rather
-        # than the clean no-op a second opener should see.
-        with self.transaction():
-            current = self.schema_version()
+        # Named outside the block so a failure can say which migration was in flight.
+        in_flight: tuple[int, str] | None = None
+        try:
+            # Inside the try: this is a DDL write, so a concurrent opener holding the
+            # migration lock for longer than `busy_timeout` makes it raise
+            # `database is locked`. That should surface as a MigrationError like every
+            # other storage failure here, not as a bare sqlite3.OperationalError.
+            self._ensure_migration_ledger()
+            with self.transaction() as con:
+                current = self.schema_version()
 
-        if current > SCHEMA_VERSION:
-            raise SchemaVersionError(
-                "database schema is newer than this build understands; refusing to open",
-                found=current,
-                supported=SCHEMA_VERSION,
-                path=str(self.path),
-            )
+                if current > SCHEMA_VERSION:
+                    raise SchemaVersionError(
+                        "database schema is newer than this build understands; refusing to open",
+                        found=current,
+                        supported=SCHEMA_VERSION,
+                        path=str(self.path),
+                    )
 
-        for version, name, script in _MIGRATIONS:
-            if version <= current:
-                continue
-            try:
-                # Deliberately NOT executescript(): it issues an implicit COMMIT before
-                # running, which would drop us out of the migration transaction and leave a
-                # partially-applied schema with no ledger row if the process died midway.
-                # Splitting and executing statement by statement keeps the schema change
-                # and its version record in one atomic unit.
-                with self.transaction() as con:
+                for version, name, script in _MIGRATIONS:
+                    if version <= current:
+                        continue
+                    in_flight = (version, name)
+                    # Deliberately NOT executescript(): it issues an implicit COMMIT before
+                    # running, which would drop us out of this transaction and could leave a
+                    # partially-applied schema with no ledger row if the process died
+                    # midway. Splitting and executing statement by statement keeps every
+                    # schema change and its version record in one atomic unit.
                     for statement in _split_statements(script):
                         con.execute(statement)
                     con.execute(
                         "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                         (version, name, to_iso(self.clock.now())),
                     )
-            except sqlite3.Error as exc:
-                raise MigrationError(
-                    f"migration {version} ({name}) failed: {exc}",
-                    version=version,
-                    name=name,
-                ) from exc
+                    in_flight = None
+        except sqlite3.Error as exc:
+            if in_flight is None:
+                raise MigrationError(f"migration failed: {exc}") from exc
+            version, name = in_flight
+            raise MigrationError(
+                f"migration {version} ({name}) failed: {exc}", version=version, name=name
+            ) from exc
 
         return self.schema_version()
 

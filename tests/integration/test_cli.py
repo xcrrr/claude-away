@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from claude_away.adapters.git import inspect_repository
 from claude_away.cli.main import EXIT_DOMAIN, EXIT_OK, build_parser, main
 from claude_away.core import repository as repo
 from claude_away.core import state
@@ -216,4 +218,523 @@ class TestNoUnsafeCommands:
             "status",
             "gate",
             "validate-config",
+            "repos",
+            "policy",
         }
+
+
+class TestRepoAndPolicyCommands:
+    """The Milestone 2A surface. Read-only: neither command may touch a repository."""
+
+    def _config(self, tmp_path: Path, *, dirty: bool = False) -> Path:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        if dirty:
+            repo.write("scratch.txt", "x")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path), "defaultBranch": "main"}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        document["safety"]["protectedPaths"] = ["infra"]
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        return config_path
+
+    def test_repos_reports_a_ready_repository(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = self._config(tmp_path)
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["count"] == 1
+        assert payload["ready"] == 1
+        assert payload["repositories"][0]["base"]["resolved"] is True
+
+    def test_repos_exits_non_zero_when_a_repository_is_not_ready(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A blocked repository is a real signal, so the exit code carries it."""
+        config_path = self._config(tmp_path, dirty=True)
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ready"] == 0
+        assert "dirty_worktree" in payload["repositories"][0]["base"]["refusals"]
+
+    def test_repos_does_not_modify_the_repository(self, tmp_path: Path) -> None:
+        from tests.gitfixtures import GitRepo
+
+        config_path = self._config(tmp_path, dirty=True)
+        repo = GitRepo(tmp_path / "api")
+        before_status = repo.git("status", "--porcelain=v2", "-z").stdout
+        before_head = repo.head()
+
+        main(["--json", "repos", "--config", str(config_path)])
+
+        assert repo.git("status", "--porcelain=v2", "-z").stdout == before_status
+        assert repo.head() == before_head
+
+    def test_repos_refuses_an_unenrolled_state_db_location(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(repo.path / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", "--config", str(config_path)]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+
+    def test_policy_prints_the_full_matrix(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from claude_away.core.policy import Operation
+
+        config_path = self._config(tmp_path)
+        assert main(["--json", "policy", "--config", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+
+        assert {d["operation"] for d in payload["decisions"]} == {op.value for op in Operation}
+        assert payload["protected_branches"] == ["main"]
+        by_operation = {d["operation"]: d for d in payload["decisions"]}
+        assert by_operation["force_push"]["allowed"] is False
+        assert by_operation["push"]["allowed"] is False
+        assert by_operation["inspect"]["allowed"] is True
+
+    def test_policy_needs_no_repository_access(self, tmp_path: Path) -> None:
+        """Pure evaluation: it must work even if the repository has since vanished."""
+        import shutil
+
+        config_path = self._config(tmp_path)
+        shutil.rmtree(tmp_path / "api")
+        assert main(["--json", "policy", "--config", str(config_path)]) == EXIT_OK
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_the_config_path_may_be_positional_like_validate_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """`validate-config <path>` works, so `repos <path>` must too.
+
+        Otherwise the second command an operator types after validating their config is a
+        usage error, for no reason other than which spelling each parser happened to get.
+        """
+        config_path = self._config(tmp_path)
+        assert main(["--json", command, str(config_path)]) == EXIT_OK
+        assert json.loads(capsys.readouterr().out)
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_omitting_the_config_path_is_a_domain_error_not_a_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        assert main(["--json", command]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "validation_error"
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_two_conflicting_config_paths_are_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """Silently preferring one would run against a file the operator did not name."""
+        config_path = self._config(tmp_path)
+        other = tmp_path / "other.json"
+        other.write_text("{}", encoding="utf-8")
+
+        assert main(["--json", command, str(config_path), "--config", str(other)]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "validation_error"
+
+    @pytest.mark.parametrize("command", ["repos", "policy"])
+    def test_the_same_path_given_twice_is_accepted(self, tmp_path: Path, command: str) -> None:
+        config_path = self._config(tmp_path)
+        assert main(["--json", command, str(config_path), "--config", str(config_path)]) == EXIT_OK
+
+
+class TestReposIsolatesPerRepositoryFailures:
+    def test_one_unreadable_repository_does_not_blind_the_report(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A supervisor reads this to decide what to work on.
+
+        A single repository that cannot be inspected used to raise out of the loop and take
+        every other repository's verdict with it -- and an unreadable repository is exactly
+        the situation where knowing about the others matters.
+        """
+        from tests.gitfixtures import make_repo
+
+        healthy = make_repo(tmp_path / "healthy")
+        broken = make_repo(tmp_path / "broken")
+        # A repository-local command key is caught by `_enrol_one`, so this exercises
+        # enrolment's per-project failure recording. `cmd_repos`' own GitError boundary is
+        # covered separately below -- naming a class after a guard is not the same as
+        # reaching it.
+        broken.git("config", "filter.evil.clean", "/bin/true")
+
+        document = config_document()
+        document["projects"] = [
+            {"id": "broken", "path": str(broken.path), "defaultBranch": "main"},
+            {"id": "healthy", "path": str(healthy.path), "defaultBranch": "main"},
+        ]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+
+        by_id = {entry["project_id"]: entry for entry in payload["repositories"]}
+        assert by_id["broken"]["error"]["code"] == "unsafe_repository_config"
+        assert by_id["healthy"]["base"]["resolved"] is True
+        assert payload["count"] == 2
+
+
+class TestPolicyAccountsForDiscoveredBranches:
+    def _config(self, tmp_path: Path, *, declare: bool) -> Path:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+        project: dict[str, Any] = {"id": "api", "path": str(repo.path)}
+        if declare:
+            project["defaultBranch"] = "trunk"
+
+        document = config_document()
+        document["projects"] = [project]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        return config_path
+
+    def test_a_discovered_default_branch_is_protected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`repos` resolved a base on `trunk` while `policy` reported no protected branch."""
+        config_path = self._config(tmp_path, declare=False)
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["protected_branches"] == ["trunk"]
+        assert payload["projects_with_unknown_default_branch"] == []
+
+    def test_a_declared_branch_is_still_protected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = self._config(tmp_path, declare=True)
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        assert json.loads(capsys.readouterr().out)["protected_branches"] == ["trunk"]
+
+    def test_a_project_with_no_determinable_default_is_named(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "No protected branch" and "we could not tell" are different answers."""
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["protected_branches"] == []
+        assert payload["projects_with_unknown_default_branch"] == ["api"]
+
+    def test_the_matrix_still_prints_when_the_repository_is_gone(self, tmp_path: Path) -> None:
+        """The flags are a property of the configuration, not of the filesystem."""
+        import shutil
+
+        config_path = self._config(tmp_path, declare=True)
+        shutil.rmtree(tmp_path / "api")
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+
+
+class TestInitRefusesToLiveInsideARepository:
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            ".claude-away/state.db",  # the directory the quickstart creates
+            "src/state.db",
+            "deep/nested/state.db",
+        ],
+    )
+    def test_an_existing_parent_directory_does_not_disarm_the_guard(
+        self, tmp_path: Path, relative: str
+    ) -> None:
+        """Every earlier case here used a path whose parents did NOT exist.
+
+        That gap hid a real bypass for one commit: the guard asked `inspect_repository`,
+        which had been rewritten to require a repository *root* and to raise
+        `NotAGitRepositoryError` for anything else -- including a path deep inside a
+        repository -- and the guard read that as "not a repository, pass". A single `mkdir`
+        was enough to put the ledger that decides whether work is DONE inside the repository
+        it judges. The parametrisation exists so the shape cannot go untested again.
+        """
+        from claude_away.cli.main import _assert_db_outside_a_repository
+        from claude_away.errors import UnsafeStateLocationError
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        target = repo.path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        with pytest.raises(UnsafeStateLocationError):
+            _assert_db_outside_a_repository(target)
+        assert not target.exists()
+
+    def test_the_default_does_not_follow_the_working_directory(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`awayctl init` inside a repository is the obvious thing to do, and used to be a trap.
+
+        The default was `./.claude-away/state.db`, so running it from a repository -- what
+        the README's own quickstart does -- put the ledger that decides DONE inside a
+        repository Claude Away works in, and left an untracked directory that made every
+        later inspection report that repository dirty.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
+        monkeypatch.chdir(repo.path)
+
+        assert main(["--json", "init"]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        # Compared after resolve() on both sides: `cmd_init` emits a resolved path, and on
+        # macOS the temp root is reached through /var -> /private/var, so a raw string
+        # prefix check would be asserting a platform detail rather than the behaviour.
+        assert Path(payload["path"]).resolve().is_relative_to((tmp_path / "state").resolve())
+        assert not (repo.path / ".claude-away").exists()
+        assert inspect_repository(repo.path).status.is_clean
+
+    def test_a_default_that_would_still_land_in_a_repository_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Belt and braces: the guard does not rest on the default being well chosen."""
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        monkeypatch.setenv("XDG_STATE_HOME", str(repo.path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
+
+        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+
+    def test_an_explicit_db_path_inside_a_repository_is_also_refused(self, tmp_path: Path) -> None:
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        assert main(["--json", "--db", str(repo.path / "nested" / "state.db"), "init"]) == (
+            EXIT_DOMAIN
+        )
+
+    def test_a_path_outside_every_repository_still_works(self, tmp_path: Path) -> None:
+        assert main(["--json", "--db", str(tmp_path / "state" / "state.db"), "init"]) == EXIT_OK
+        assert (tmp_path / "state" / "state.db").exists()
+
+
+class TestInitGuardFailsClosed:
+    """A check that could not run is not a check that passed."""
+
+    def test_a_repository_with_a_local_filter_does_not_disable_the_guard(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`git lfs install --local` writes exactly this key. No hostility required.
+
+        The guard caught the base GitError, so UnsafeRepositoryConfigError -- raised for the
+        repository the audit considers *least* trustworthy -- read as "not a repository",
+        and the ledger that decides DONE was created inside it.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        repo.git("config", "--local", "filter.lfs.clean", "git-lfs clean -- %f")
+        monkeypatch.setenv("XDG_STATE_HOME", str(repo.path / "state"))
+        monkeypatch.delenv("CLAUDE_AWAY_DB", raising=False)
+
+        assert main(["--json", "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+        assert not (repo.path / "state").exists()
+
+    @pytest.mark.parametrize("shape", ["file-in-chain", "missing-dirs"])
+    def test_a_path_inside_a_repository_is_refused_whatever_the_chain_looks_like(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], shape: str
+    ) -> None:
+        """The walk-up stopped at the nearest existing PATH, not the nearest directory.
+
+        A file in the chain therefore ended it, `git -C <file>` failed, and the guard read
+        that failure as "not a repository" and passed. The ledger did not land there because
+        mkdir fails next, but the guard was answering a different question than it appears
+        to and answering it the unsafe way.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api")
+        if shape == "file-in-chain":
+            (repo.path / "afile").write_text("x", encoding="utf-8")
+            target = repo.path / "afile" / "b" / "state.db"
+        else:
+            target = repo.path / "deep" / "nested" / "state.db"
+
+        assert main(["--json", "--db", str(target), "init"]) == EXIT_DOMAIN
+        assert json.loads(capsys.readouterr().out)["code"] == "unsafe_state_location"
+        assert not list(repo.path.rglob("state.db"))
+
+    def test_a_genuine_non_repository_is_still_allowed(self, tmp_path: Path) -> None:
+        assert main(["--json", "--db", str(tmp_path / "elsewhere" / "state.db"), "init"]) == EXIT_OK
+
+
+class TestReposDoesNotLaunderProvenance:
+    def test_a_discovered_branch_is_never_relabelled_as_configured(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`cmd_repos` re-inspected, feeding the discovered value back in as the operator's.
+
+        The JSON then carried two contradictory provenance claims for one branch, and the
+        false one asserted operator authority for a string the repository wrote.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="trunk")
+        repo.git("update-ref", "refs/remotes/origin/trunk", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path)}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_OK
+        entry = json.loads(capsys.readouterr().out)["repositories"][0]
+
+        assert entry["default_branch_source"] == "origin_head"
+        assert entry["inspection"]["default_branch_source"] == "origin_head"
+
+
+class TestProtectedBranchesAreATrueUnion:
+    def test_a_decoy_adds_protection_rather_than_moving_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The union was documented and impossible: the resolver never looked at both.
+
+        For a declared project the discovered value was never read, so a decoy in
+        origin/HEAD could not add; for an undeclared one the declared value did not exist,
+        so the decoy REPLACED the protected branch. Both halves must now hold.
+        """
+        from tests.gitfixtures import make_repo
+
+        repo = make_repo(tmp_path / "api", initial_branch="main")
+        repo.git("update-ref", "refs/remotes/origin/decoy", repo.head())
+        repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/decoy")
+
+        document = config_document()
+        document["projects"] = [{"id": "api", "path": str(repo.path), "defaultBranch": "main"}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["protected_branches"] == ["decoy", "main"], (
+            "the declared branch must survive a decoy, and the decoy must only add"
+        )
+
+
+class TestReposOwnErrorBoundary:
+    """`cmd_repos` catches GitError around inspection and base resolution.
+
+    The class named for this previously built its broken repository with a config key that
+    `_enrol_one` rejects, so the failure never reached `cmd_repos` at all and its `except`
+    branch was never executed. This reaches it by making resolution itself fail.
+    """
+
+    def test_a_failure_after_enrolment_is_reported_against_its_project(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from claude_away.errors import GitCommandError
+        from tests.gitfixtures import make_repo
+
+        healthy = make_repo(tmp_path / "healthy")
+        awkward = make_repo(tmp_path / "awkward")
+
+        document = config_document()
+        document["projects"] = [
+            {"id": "awkward", "path": str(awkward.path), "defaultBranch": "main"},
+            {"id": "healthy", "path": str(healthy.path), "defaultBranch": "main"},
+        ]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        real = main.__globals__["resolve_expected_base"]
+
+        def failing(inspection: object, **kwargs: object) -> object:
+            if kwargs.get("project_id") == "awkward":
+                raise GitCommandError(["git", "rev-parse"], 128, "simulated post-enrolment failure")
+            return real(inspection, **kwargs)
+
+        monkeypatch.setitem(main.__globals__, "resolve_expected_base", failing)
+
+        assert main(["--json", "repos", str(config_path)]) == EXIT_DOMAIN
+        payload = json.loads(capsys.readouterr().out)
+        by_id = {entry["project_id"]: entry for entry in payload["repositories"]}
+
+        assert by_id["awkward"]["error"]["code"] == "git_command_failed"
+        assert by_id["healthy"]["base"]["resolved"] is True
+
+
+class TestUnreadableConfigFiles:
+    @pytest.mark.parametrize("command", ["validate-config", "repos", "policy"])
+    def test_a_non_utf8_config_is_an_error_not_a_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+    ) -> None:
+        """UnicodeDecodeError is a ValueError, not an OSError, so it escaped the handler."""
+        path = tmp_path / "config.json"
+        path.write_bytes(b"\xff\xfe{\x00}\x00")
+
+        assert main(["--json", command, str(path)]) == 1
+        assert json.loads(capsys.readouterr().out)["code"] == "unreadable_file"
+
+
+class TestPolicyDegradesAudibly:
+    def test_a_project_whose_repository_cannot_be_read_is_reported_as_unknown(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "No protected branches" and "we could not check" must not look the same.
+
+        The `except ClaudeAwayError` fallback returned an empty `unknown`, which asserted
+        that every project's default branch was accounted for when none had been checked.
+        """
+        document = config_document()
+        document["projects"] = [{"id": "gone", "path": str(tmp_path / "missing")}]
+        document["stateDbPath"] = str(tmp_path / "state" / "state.db")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert main(["--json", "policy", str(config_path)]) == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["projects_with_unknown_default_branch"] == ["gone"]
+
+
+class TestXdgStateHome:
+    def test_a_relative_value_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The spec says a relative value is invalid; honouring one restored the cwd default."""
+        from claude_away.cli.main import default_db_path
+
+        monkeypatch.setenv("XDG_STATE_HOME", "relative-state")
+        assert default_db_path().is_absolute()
+
+    def test_an_absolute_value_is_used(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from claude_away.cli.main import default_db_path
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert default_db_path() == tmp_path / "claude-away" / "state.db"

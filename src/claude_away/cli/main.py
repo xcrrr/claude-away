@@ -26,22 +26,51 @@ from pathlib import Path
 from typing import Any
 
 from claude_away import __version__
+from claude_away.core.base_revision import resolve_expected_base
 from claude_away.core.dag import blocking_dependencies, find_cycle
 from claude_away.core.db import SCHEMA_VERSION, Database, open_database
+from claude_away.core.enrolment import enrol_projects
 from claude_away.core.evidence import evaluate_gate
 from claude_away.core.leases import active_lease, expired_leases
 from claude_away.core.models import TaskStatus
+from claude_away.core.policy import Operation, SafetyPolicy
 from claude_away.core.repository import list_tasks, runner_id, task_nodes
 from claude_away.core.state import active_attempt, list_attempts
 from claude_away.core.validation import validate_config_document
-from claude_away.errors import ClaudeAwayError
+from claude_away.errors import (
+    ClaudeAwayError,
+    GitError,
+    UnsafeStateLocationError,
+    ValidationError,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_DOMAIN = 3
 
-DEFAULT_DB_PATH = Path(".claude-away") / "state.db"
+
+def default_db_path() -> Path:
+    """Where the state database lives when nothing says otherwise.
+
+    Under the XDG state directory, not ``./.claude-away/state.db``. The working-directory
+    relative default meant ``awayctl init`` run from inside a repository -- the obvious
+    place to run it, and what the README's own quickstart does -- created the ledger that
+    decides whether work is DONE *inside a repository Claude Away works in*: the exact
+    arrangement ``enrol_projects`` refuses for a configured ``stateDbPath``. It also left an
+    untracked directory behind, so every later inspection reported that repository dirty and
+    base resolution refused forever.
+
+    A path anchored to the user rather than to the shell's cwd cannot drift into a
+    repository by accident, and one state database per user is the right default for a tool
+    that supervises several repositories at once.
+    """
+    root = os.environ.get("XDG_STATE_HOME")
+    # The XDG spec says a relative value is invalid and must be ignored. Honouring one would
+    # reintroduce the exact property this function was rewritten to remove: a default that
+    # resolves against whatever directory the shell happens to be in.
+    base = Path(root) if root and Path(root).is_absolute() else Path.home() / ".local" / "state"
+    return base / "claude-away" / "state.db"
 
 
 def _emit(payload: Any, *, as_json: bool, human: str) -> None:
@@ -55,7 +84,7 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     if args.db:
         return Path(args.db)
     env = os.environ.get("CLAUDE_AWAY_DB")
-    return Path(env) if env else DEFAULT_DB_PATH
+    return Path(env) if env else default_db_path()
 
 
 def _open(args: argparse.Namespace, *, migrate: bool = False) -> Database:
@@ -82,9 +111,69 @@ def cmd_version(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _assert_db_outside_a_repository(path: Path) -> None:
+    """Refuse to put the state database inside a Git repository.
+
+    ``enrol_projects`` already refuses a configured ``stateDbPath`` inside an enrolled
+    repository, for a reason it states plainly: the ledger that decides whether work is DONE
+    must not be reachable from inside the thing being judged. But ``awayctl init`` takes its
+    path from ``--db``, ``CLAUDE_AWAY_DB`` or a *working-directory-relative* default, none of
+    which went anywhere near that check -- so running ``awayctl init`` from inside a
+    repository created exactly the arrangement the other guard exists to forbid, and left an
+    untracked ``.claude-away/`` behind that made every later inspection report the repository
+    dirty.
+
+    Checked against any repository, not just enrolled ones: at ``init`` time there is no
+    configuration to consult, and "inside some repository" is the property that matters.
+
+    The question is answered from the filesystem, by walking up looking for a ``.git``
+    entry, rather than by asking ``inspect_repository``. That is a correction, not a
+    simplification. ``inspect_repository`` was rewritten to require a repository *root* and
+    to raise ``NotAGitRepositoryError`` for anything else -- including a path deep inside a
+    repository -- and this guard read that as "not a repository, pass". One ``mkdir`` was
+    enough: with ``<repo>/.claude-away/`` already present, ``awayctl init`` created the
+    ledger inside the repository and exited 0. The guard only still fired when the whole
+    parent chain was missing, which is the only shape its tests covered.
+
+    A walk-up is also the right primitive independently. It consults no configuration, so
+    nothing a repository can write changes the answer, and it needs no Git process -- so
+    unlike the previous version it cannot be turned off by a repository whose configuration
+    makes Git fail. It deliberately does not care *which* repository, only that there is
+    one.
+    """
+    resolved = path.expanduser().resolve()
+    # Nearest existing DIRECTORY, not nearest existing path. Stopping at the first thing
+    # that exists meant a *file* in the chain ended the walk -- `--db <repo>/somefile/x/db`
+    # probed `<repo>/somefile`, `git -C` on a file fails, and the guard read that as "not a
+    # repository" and passed. The ledger did not actually land there (mkdir fails next), but
+    # the guard was answering a different question than it appears to, and its answer was
+    # the unsafe one.
+    probe = resolved.parent
+    while not probe.is_dir() and probe.parent != probe:
+        probe = probe.parent
+
+    root: Path | None = None
+    for candidate in (probe, *probe.parents):
+        if (candidate / ".git").exists():
+            root = candidate
+            break
+    if root is None:
+        return  # genuinely not inside a repository, which is what we want
+
+    raise UnsafeStateLocationError(
+        f"refusing to create the state database inside the Git repository at "
+        f"{root}: the ledger that decides whether work is DONE must live "
+        f"outside the repositories it judges. Pass --db, or set CLAUDE_AWAY_DB, to a "
+        f"location outside any repository",
+        path=str(path),
+        repository_root=str(root),
+    )
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Create and migrate a state database."""
     path = _resolve_db_path(args)
+    _assert_db_outside_a_repository(path)
     existed = path.exists()
     db = open_database(path, migrate=True)
     try:
@@ -309,6 +398,218 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _add_config_argument(parser: argparse.ArgumentParser) -> None:
+    """Accept the configuration path either positionally or as ``--config``.
+
+    ``validate-config`` takes a bare path, so a command that only accepted ``--config``
+    would make the very next thing an operator types an error. Both spellings work;
+    supplying neither, or both, is refused rather than silently preferring one.
+    """
+    parser.add_argument("path", nargs="?", help="path to the configuration file")
+    parser.add_argument("--config", dest="config", default=None, help=argparse.SUPPRESS)
+
+
+def _config_path(args: argparse.Namespace) -> Path:
+    positional, flag = args.path, args.config
+    if positional and flag and Path(positional) != Path(flag):
+        raise ValidationError(
+            "give the configuration path once, not both positionally and --config"
+        )
+    chosen = positional or flag
+    if not chosen:
+        raise ValidationError("a configuration file path is required")
+    return Path(chosen)
+
+
+def cmd_repos(args: argparse.Namespace) -> int:
+    """Inspect every enrolled repository. Strictly read-only.
+
+    Exercises the whole Milestone 2A boundary end to end: enrolment canonicalises and
+    authorises the paths, Git inspection describes them, and base resolution says whether
+    each one could be branched from. Nothing here writes to a repository.
+    """
+    config_path = _config_path(args)
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    validate_config_document(document)
+
+    enrolment = enrol_projects(document, config_dir=config_path.parent)
+
+    repositories: list[dict[str, Any]] = [
+        {**failure.to_dict(), "root": str(failure.configured_path)}
+        for failure in enrolment.failures
+    ]
+    ready = 0
+    for repository in enrolment.repositories:
+        entry: dict[str, Any] = dict(repository.to_dict())
+        try:
+            # The inspection enrolment already performed, not a second one. Re-inspecting
+            # with `configured_default_branch=repository.default_branch` fed a value the
+            # repository may itself have asserted back in through the parameter reserved for
+            # the operator's declaration, so the JSON carried `origin_head` at the top level
+            # and `configured` in the nested inspection for the same branch -- and the false
+            # one claimed operator authority.
+            inspection = enrolment.inspections[repository.project_id]
+            resolution = resolve_expected_base(inspection, project_id=repository.project_id)
+        except GitError as exc:
+            # One repository's failure must not take the report down with it. A supervisor
+            # reading `awayctl repos --json` to decide what to work on would otherwise be
+            # blinded to every other repository by a single unreadable one -- and an
+            # unreadable repository is exactly the situation where knowing about the others
+            # matters. The failure is reported in place, against the project it belongs to.
+            entry["error"] = exc.to_dict()
+            repositories.append(entry)
+            continue
+
+        ready += 1 if resolution.resolved else 0
+        entry["inspection"] = inspection.to_dict()
+        entry["base"] = resolution.to_dict()
+        repositories.append(entry)
+
+    payload = {"count": len(repositories), "ready": ready, "repositories": repositories}
+    if args.json:
+        _emit(payload, as_json=True, human="")
+        return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
+
+    for entry in repositories:
+        if "error" in entry:
+            print(f" ERROR   {entry['project_id']}  {entry['root']}")
+            print(f"      {entry['error']['code']}: {entry['error']['message']}")
+            # The details, not just the code and message. A default-deny configuration
+            # refusal that does not name the offending keys or the file they are in leaves
+            # the operator with a failure they cannot act on -- and `--json` carrying them
+            # while the human output did not is the wrong way round, because the human is
+            # the one who has to go and edit the file.
+            for name, value in sorted(entry["error"].get("details", {}).items()):
+                if value is None or name == "path":
+                    continue
+                rendered = (
+                    ", ".join(str(item) for item in value) if isinstance(value, list) else value
+                )
+                print(f"      {name}: {rendered}")
+            continue
+        base = entry["base"]
+        mark = "ok " if base["resolved"] else "BLOCKED"
+        print(f" {mark} {entry['project_id']}  {entry['root']}")
+        inspection_detail = entry["inspection"]
+        branch = inspection_detail["branch"] or "(detached)"
+        print(f"      branch {branch}  head {str(inspection_detail['head_commit'])[:12]}")
+        if base["resolved"]:
+            print(f"      base   {base['commit'][:12]} on {base['branch']}")
+        else:
+            print(f"      refused: {', '.join(base['refusals'])}")
+    return EXIT_OK if ready == len(repositories) else EXIT_DOMAIN
+
+
+def _protected_branches(document: dict[str, Any], config_dir: Path) -> tuple[list[str], list[str]]:
+    """Every branch that must be treated as protected, plus the projects nothing covers.
+
+    The configured ``defaultBranch`` alone is not enough. It is optional in the schema, and
+    the whole point of :func:`_resolve_default_branch` is to work out the default branch
+    when the configuration is silent -- so a project relying on discovery used to be
+    reported by ``awayctl policy`` as having *no* protected branch while ``awayctl repos``
+    happily resolved a base on it. The safety matrix understating the granted authority is
+    the wrong direction for the one command an operator runs to check exactly that.
+
+    Discovered branches are included, but the union is deliberate rather than a
+    replacement: ``origin/HEAD`` lives inside the repository, so treating discovery as
+    authoritative would let a decoy written there move protection off the real default.
+    Taking both means a repository can only ever *add* to what is protected.
+
+    The second return value names projects whose default branch could not be determined at
+    all. Those are reported rather than silently omitted -- "no protected branch" and "we
+    could not tell" are different answers, and only one of them is safe to act on.
+    """
+    branches: set[str] = set()
+    unknown: list[str] = []
+
+    declared: set[str] = set()
+    for project in document.get("projects", []):
+        configured = project.get("defaultBranch")
+        if configured:
+            declared.add(str(configured))
+    branches |= declared
+
+    try:
+        enrolment = enrol_projects(document, config_dir=config_dir)
+    except ClaudeAwayError:
+        # The matrix is still worth printing when the repositories cannot be read -- the
+        # flags are a property of the configuration, not of the filesystem -- so a failure
+        # here degrades to "configured branches only" instead of taking the command down.
+        #
+        # But it must degrade *audibly*. Returning an empty `unknown` here said "every
+        # project's default branch is accounted for" when in fact none had been checked,
+        # collapsing the distinction the function exists to preserve. Every project without
+        # a declaration is unknown, because that is exactly what we failed to find out.
+        undeclared = [
+            str(project.get("id", "<unnamed>"))
+            for project in document.get("projects", [])
+            if not project.get("defaultBranch")
+        ]
+        return sorted(branches), sorted(undeclared)
+
+    for repository in enrolment.repositories:
+        # Both, not whichever one won. `_resolve_default_branch` returns the configured
+        # value the moment there is one, so taking only `default_branch` made the set
+        # {declared} or {discovered} and never both -- and for a project with no declaration
+        # a decoy in `refs/remotes/origin/HEAD` therefore *moved* protection off the real
+        # branch rather than adding to it, which is the opposite of what this documented.
+        for candidate in (repository.default_branch, repository.discovered_default_branch):
+            if candidate:
+                branches.add(candidate)
+        if not repository.default_branch:
+            unknown.append(repository.project_id)
+
+    # A project that failed to enrol is in neither list otherwise: it contributes no
+    # protected branch AND no "we could not tell", so the matrix reads as though every
+    # project were accounted for. That is the exact collapse this function documents itself
+    # as preventing -- it just only fired when `enrol_projects` *raised*, and the common
+    # case records a failure instead. A failed project without a declared branch is the
+    # clearest possible case of "we could not tell".
+    for failure in enrolment.failures:
+        declared_for_failure = any(
+            str(project.get("id", "")) == failure.project_id and project.get("defaultBranch")
+            for project in document.get("projects", [])
+        )
+        if not declared_for_failure:
+            unknown.append(failure.project_id)
+
+    return sorted(branches), sorted(set(unknown))
+
+
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Print the full allow/deny matrix for a configuration.
+
+    Reads repositories only to learn which branches are protected, and degrades to the
+    configured branches if it cannot.
+    """
+    config_path = _config_path(args)
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    validate_config_document(document)
+
+    protected_branches, unknown_default = _protected_branches(document, config_path.parent)
+    policy = SafetyPolicy.from_config(document, protected_branches=protected_branches)
+
+    decisions = [policy.evaluate(operation).to_dict() for operation in Operation]
+    payload = {
+        "protected_branches": protected_branches,
+        "protected_paths": list(policy.protected_paths),
+        "projects_with_unknown_default_branch": unknown_default,
+        "decisions": decisions,
+    }
+    if args.json:
+        _emit(payload, as_json=True, human="")
+        return EXIT_OK
+
+    print(f"protected branches: {', '.join(protected_branches) or '(none)'}")
+    print(f"protected paths   : {', '.join(policy.protected_paths) or '(none)'}")
+    if unknown_default:
+        print(f"default branch unknown for: {', '.join(unknown_default)}")
+    for decision in decisions:
+        verdict = "allow" if decision["allowed"] else "DENY "
+        print(f"  {verdict} {decision['operation']:<20} [{decision['rule']}]")
+    return EXIT_OK
+
+
 # ======================================================================================
 # Parser
 # ======================================================================================
@@ -341,6 +642,17 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path")
     validate.set_defaults(func=cmd_validate_config)
 
+    # `path` positional, matching `validate-config`, so the three config-reading commands
+    # take their argument the same way. `--config` stays as an accepted spelling because
+    # it reads better in scripts, but exactly one of the two must be given.
+    repos = sub.add_parser("repos", help="inspect enrolled repositories (read-only)")
+    _add_config_argument(repos)
+    repos.set_defaults(func=cmd_repos)
+
+    policy = sub.add_parser("policy", help="show the allow/deny matrix for a configuration")
+    _add_config_argument(policy)
+    policy.set_defaults(func=cmd_policy)
+
     return parser
 
 
@@ -356,8 +668,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"error [{error.code}]: {error}", file=sys.stderr)
         return EXIT_DOMAIN
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        # UnicodeDecodeError is a ValueError, not an OSError, so a configuration file that is
+        # UTF-16, carries the wrong BOM, or is simply not text produced a Python traceback
+        # from every config-reading command rather than an error message and exit 1.
+        message = {"code": "unreadable_file", "message": str(error)}
+        if args.json:
+            print(json.dumps(message, indent=2, sort_keys=True))
+        else:
+            print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
 
